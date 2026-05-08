@@ -1,0 +1,19 @@
+[package]
+name        = "smrp-core"
+description = "Core library for SMRP — Secure Minimal Reliable Protocol (crypto, handshake, transport, high-level API)"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+keywords.workspace   = true
+categories.workspace = true
+
+[dependencies]
+ring       = "0.17"
+thiserror  = "1"
+bytes      = "1"
+tokio      = { version = "1", features = ["full"] }
+tracing    = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

@@ -1,0 +1,19 @@
+/target/
+Cargo.lock
+
+# Debug symbols
+*.pdb
+
+# IDE / editor
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env / secrets
+.env
+*.key
+*.pem

@@ -1,0 +1,20 @@
+[package]
+name        = "smrp-server"
+description = "SMRP echo server — reference server implementation for the Secure Minimal Reliable Protocol"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+keywords.workspace   = true
+categories.workspace = true
+
+[[bin]]
+name = "smrp-server"
+path = "src/main.rs"
+
+[dependencies]
+smrp-core          = { path = "../smrp-core" }
+tokio              = { version = "1", features = ["full"] }
+tracing            = "0.1"
+tracing-subscriber = "0.3"
+hex                = "0.4"

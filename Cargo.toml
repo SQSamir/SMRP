@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "smrp-core",
+    "smrp-server",
+    "smrp-cli",
+]
+
+[workspace.package]
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT"
+repository  = "https://github.com/SQSamir/smrp"
+keywords    = ["protocol", "encryption", "udp", "networking", "security"]
+categories  = ["network-programming", "cryptography"]
