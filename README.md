@@ -19,12 +19,16 @@ a minimal, auditable implementation in safe Rust.
 - **ChaCha20-Poly1305 AEAD** — authenticated encryption for every data packet
 - **HKDF-SHA-256 key derivation** — independent send/receive keys per direction
 - **Ed25519 handshake signatures** — mutual authentication without a PKI
-- **RFC 6479 anti-replay window** — 128-bit sliding window, two-phase DoS-safe design
-- **ACK + FIN/FIN_ACK teardown** — graceful session lifecycle
-- **Keepalive probes** — idle sessions send KEEPALIVE every 15 s
+- **RFC 6479 anti-replay window** — 128-packet sliding window, two-phase DoS-safe design
+- **Graceful teardown** — FIN / FIN_ACK exchange; configurable `fin_ack_timeout`
+- **Keepalive probes** — KEEPALIVE / KEEPALIVE_ACK every 15 s when idle (configurable)
+- **Dead session eviction** — sessions with no traffic for 45 s are freed automatically
 - **HELLO rate limiting** — 10 HELLO/IP/s; excess silently dropped before any crypto
-- **HELLO timestamp validation** — rejects stale handshake packets (±30 s clock skew)
+- **HELLO timestamp validation** — rejects stale or future handshake packets (±30 s)
 - **MAX_SESSIONS enforcement** — hard cap with ERROR reply to the client
+- **Configurable runtime parameters** — `SmrpConfig` controls all timeouts and limits
+- **Operational metrics** — `SmrpMetrics` exposes 12 atomic counters + snapshot API
+- **Graceful listener shutdown** — sends real FIN packets to all connected peers
 - **connect() / recv() timeouts** — never block forever; caller-configurable deadlines
 - **Async-first API** — built on Tokio, per-handshake concurrency
 - **Tiny on-wire footprint** — 54-byte fixed header, max 1 350-byte packet
@@ -33,12 +37,12 @@ a minimal, auditable implementation in safe Rust.
 
 ## Cryptographic Suite
 
-| Primitive          | Algorithm          | Library        |
-|--------------------|--------------------|----------------|
-| Key agreement      | X25519             | [ring](https://github.com/briansmith/ring) |
-| Symmetric cipher   | ChaCha20-Poly1305  | ring           |
-| Key derivation     | HKDF-SHA-256       | ring           |
-| Handshake signing  | Ed25519            | ring           |
+| Primitive         | Algorithm         | Library                                    |
+|-------------------|-------------------|--------------------------------------------|
+| Key agreement     | X25519            | [ring](https://github.com/briansmith/ring) |
+| Symmetric cipher  | ChaCha20-Poly1305 | ring                                       |
+| Key derivation    | HKDF-SHA-256      | ring                                       |
+| Handshake signing | Ed25519           | ring                                       |
 
 ---
 
@@ -53,43 +57,43 @@ Offset  Size  Field
 4       1     Version = 0x01
 5       1     Packet Type
 6       1     Flags  (bit 0 = FIN, bit 1 = KEY_UPDATE_REQUESTED)
-7       1     Reserved
+7       1     Reserved (must be 0x00)
 8       8     Session ID
 16      8     Sequence Number
 24      8     ACK Number  (cumulative ack for the reverse direction)
-32      8     Timestamp µs
+32      8     Timestamp µs  (sender clock, µs since Unix epoch)
 40      2     Payload Length
-42      12    Reserved / padding
+42      12    Reserved / padding (must be 0x00)
 --- header total: 54 bytes ---
 54      N     Encrypted payload  (ChaCha20-Poly1305 ciphertext)
 54+N    16    Poly1305 authentication tag
 ```
 
-| Field      | Size     | Notes                           |
-|------------|----------|---------------------------------|
-| Header     | 54 bytes | Fixed, always present           |
-| Payload    | 0–1280 B | AEAD ciphertext                 |
-| Auth tag   | 16 bytes | Poly1305, appended to payload   |
-| Max packet | 1350 B   | Fits in IPv6 min MTU (1280 B)   |
+| Field      | Size     | Notes                         |
+|------------|----------|-------------------------------|
+| Header     | 54 bytes | Fixed, always present         |
+| Payload    | 0–1280 B | AEAD ciphertext               |
+| Auth tag   | 16 bytes | Poly1305, appended to payload |
+| Max packet | 1350 B   | Fits in IPv6 min MTU (1280 B) |
 
 ### Packet Types
 
-| Wire | Name           | Description                              |
-|------|----------------|------------------------------------------|
-| 0x01 | HELLO          | Handshake initiation                     |
-| 0x02 | HELLO_ACK      | Handshake response                       |
-| 0x03 | DATA           | Application data (encrypted)             |
-| 0x04 | ACK            | Cumulative acknowledgement               |
-| 0x05 | KEEPALIVE      | Liveness probe                           |
-| 0x06 | KEEPALIVE_ACK  | Keepalive response                       |
-| 0x07 | KEY_UPDATE     | In-band rekeying initiation              |
-| 0x08 | KEY_UPDATE_ACK | Rekeying acknowledgement                 |
-| 0x09 | FIN            | Graceful teardown                        |
-| 0x0A | ERROR          | Protocol error notification              |
-| 0x0B | FIN_ACK        | Acknowledge FIN                          |
-| 0x0C | RESET          | Immediate abort *(planned)*              |
-| 0x0D | PING           | RTT measurement *(planned)*              |
-| 0x0E | PONG           | RTT response *(planned)*                 |
+| Wire | Name           | Description                                | Status      |
+|------|----------------|--------------------------------------------|-------------|
+| 0x01 | HELLO          | Handshake initiation                       | Implemented |
+| 0x02 | HELLO_ACK      | Handshake response                         | Implemented |
+| 0x03 | DATA           | Application data (encrypted)               | Implemented |
+| 0x04 | ACK            | Cumulative acknowledgement                 | Implemented |
+| 0x05 | KEEPALIVE      | Liveness probe                             | Implemented |
+| 0x06 | KEEPALIVE_ACK  | Keepalive response                         | Implemented |
+| 0x07 | KEY_UPDATE     | In-band rekeying initiation                | Planned     |
+| 0x08 | KEY_UPDATE_ACK | Rekeying acknowledgement                   | Planned     |
+| 0x09 | FIN            | Graceful teardown                          | Implemented |
+| 0x0A | ERROR          | Protocol error notification                | Implemented |
+| 0x0B | FIN_ACK        | Acknowledge FIN                            | Implemented |
+| 0x0C | RESET          | Immediate abort                            | Planned     |
+| 0x0D | PING           | RTT measurement request                    | Planned     |
+| 0x0E | PONG           | RTT measurement response                   | Planned     |
 
 ---
 
@@ -134,10 +138,12 @@ INFO done
 
 ## Embedding SMRP in Your Application
 
+### Minimal usage (default config)
+
 ```rust
 use smrp_core::conn::{SmrpConnection, SmrpListener};
 
-// Server
+// Server — accept loop
 let mut listener = SmrpListener::bind("0.0.0.0:9000").await?;
 while let Some(mut conn) = listener.accept().await {
     tokio::spawn(async move {
@@ -150,8 +156,41 @@ while let Some(mut conn) = listener.accept().await {
 // Client — connect() times out after 10 s, recv() after 60 s
 let mut conn = SmrpConnection::connect("127.0.0.1:9000").await?;
 conn.send(b"hello").await?;
-let reply = conn.recv().await?;          // Ok(Some(plaintext))
-conn.close().await?;                     // sends FIN, waits for FIN_ACK
+let reply = conn.recv().await?;   // Ok(Some(plaintext bytes))
+conn.close().await?;              // sends FIN, waits for FIN_ACK
+```
+
+### Custom config and metrics
+
+```rust
+use smrp_core::{
+    config::SmrpConfig,
+    conn::{SmrpConnection, SmrpListener},
+};
+use std::{sync::Arc, time::Duration};
+
+let cfg = Arc::new(SmrpConfig {
+    keepalive_interval:   Duration::from_secs(5),
+    session_dead_timeout: Duration::from_secs(15),
+    max_sessions:         1_000,
+    recv_timeout:         Duration::from_secs(30),
+    ..SmrpConfig::default()
+});
+
+let mut listener = SmrpListener::bind_with_config("0.0.0.0:9000", cfg.clone()).await?;
+let metrics = listener.metrics();
+
+// Read a snapshot any time
+let snap = metrics.snapshot();
+println!("active={} total={} auth_failures={}",
+    snap.sessions_active, snap.sessions_total, snap.auth_failures);
+```
+
+### Graceful shutdown
+
+```rust
+// Sends FIN to all connected peers, then stops accepting
+listener.shutdown().await;
 ```
 
 ---
@@ -161,21 +200,27 @@ conn.close().await?;                     // sends FIN, waits for FIN_ACK
 ```
 smrp/
 ├── smrp-core/          # Library: crypto, handshake, transport, high-level API
-│   └── src/
-│       ├── conn.rs     # SmrpConnection / SmrpListener public API
-│       ├── constants.rs
-│       ├── crypto.rs   # X25519, ChaCha20-Poly1305, HKDF, Ed25519
-│       ├── error.rs
-│       ├── handshake.rs
-│       ├── packet.rs   # Header parse/serialize, PacketType, Flags
-│       ├── replay.rs   # RFC 6479 anti-replay window
-│       ├── session.rs
-│       └── transport.rs
+│   ├── src/
+│   │   ├── conn.rs       # SmrpConnection / SmrpListener public API
+│   │   ├── config.rs     # SmrpConfig — runtime-tunable parameters
+│   │   ├── constants.rs  # Compile-time wire constants
+│   │   ├── crypto.rs     # X25519, ChaCha20-Poly1305, HKDF, Ed25519
+│   │   ├── error.rs      # SmrpError enum + wire codes
+│   │   ├── handshake.rs  # Client/server handshake logic, key derivation
+│   │   ├── metrics.rs    # SmrpMetrics atomic counters + MetricsSnapshot
+│   │   ├── packet.rs     # Header parse/serialize, PacketType, Flags
+│   │   ├── replay.rs     # RFC 6479 anti-replay window
+│   │   ├── session.rs    # SessionId, SessionState, Session
+│   │   └── transport.rs  # Raw UDP send/recv (Windows ICMP-safe)
+│   └── fuzz/             # cargo-fuzz targets (requires nightly)
+│       └── fuzz_targets/
+│           ├── fuzz_packet_parse.rs   # Arbitrary bytes → header parser
+│           ├── fuzz_hello_payload.rs  # Valid header + fuzz payload
+│           └── fuzz_replay_window.rs  # Arbitrary (seq, action) pairs
 ├── smrp-server/        # Binary: reference echo server
 ├── smrp-cli/           # Binary: command-line client
-├── proto/python/       # Python prototype / interop reference
 ├── docs/
-│   └── SPEC.md         # Full protocol specification (v0.2)
+│   └── SPEC.md         # Full protocol specification (v0.3)
 └── LICENSE
 ```
 
@@ -187,42 +232,66 @@ smrp/
 cargo test --workspace
 ```
 
-**45 tests** across all modules:
+**49 tests** across all modules:
 
-| Module      | Tests | Coverage                                                    |
-|-------------|-------|-------------------------------------------------------------|
-| `constants` | 4     | Size arithmetic, magic bytes                                |
-| `error`     | 5     | Wire-code round-trip, all 11 variants                       |
-| `packet`    | 13    | Parse/serialize, all packet types, flag bits                |
-| `session`   | 3     | SessionId equality, state copy                              |
-| `replay`    | 11    | In-order, replay, out-of-order, two-phase, window slide     |
-| `conn`      | 8     | Round-trip, concurrency, max payload, timeouts, FIN/FIN_ACK |
-| doc-tests   | 2     | API examples compile and run                                |
+| Module      | Tests | Coverage                                                          |
+|-------------|-------|-------------------------------------------------------------------|
+| `constants` | 4     | Size arithmetic, magic bytes                                      |
+| `error`     | 5     | Wire-code round-trip, all 11 variants                             |
+| `packet`    | 13    | Parse/serialize, all 14 packet types, flag bits                   |
+| `session`   | 3     | SessionId equality, state copy                                    |
+| `replay`    | 11    | In-order, replay, out-of-order, two-phase, window slide           |
+| `conn`      | 11    | Round-trip, concurrency, max payload, timeouts, FIN/FIN_ACK,      |
+|             |       | metrics, custom config, shutdown, no-accept-after-shutdown        |
+| doc-tests   | 2     | API examples compile and run                                      |
+
+### Running Fuzz Targets
+
+Requires Rust nightly and `cargo-fuzz`:
+
+```sh
+rustup install nightly
+cargo install cargo-fuzz
+cd smrp-core
+
+# Fuzz the packet header parser
+cargo +nightly fuzz run fuzz_packet_parse
+
+# Fuzz HELLO payload parsing and signature verification
+cargo +nightly fuzz run fuzz_hello_payload
+
+# Fuzz the RFC 6479 anti-replay sliding window
+cargo +nightly fuzz run fuzz_replay_window
+```
 
 ---
 
 ## Security Properties
 
-| Property               | Mechanism                                             |
-|------------------------|-------------------------------------------------------|
-| Confidentiality        | ChaCha20-Poly1305 per packet                          |
-| Integrity              | Poly1305 auth tag, AEAD                               |
-| Mutual authentication  | Ed25519 signatures over session ID + ephemeral pubkey |
-| Forward secrecy        | Ephemeral X25519 key exchange per session             |
-| Replay protection      | RFC 6479 sliding window (128 packets), two-phase      |
-| Key separation         | HKDF derives independent c→s and s→c keys            |
-| HELLO replay defence   | ±30 s timestamp validation on all HELLO packets       |
-| DoS — HELLO flood      | 10 HELLO/IP/s rate limit before any crypto runs       |
-| DoS — session exhaustion | MAX_SESSIONS hard cap with ERROR reply              |
+| Property                  | Mechanism                                              |
+|---------------------------|--------------------------------------------------------|
+| Confidentiality           | ChaCha20-Poly1305 per packet                           |
+| Integrity                 | Poly1305 auth tag, AEAD                                |
+| Mutual authentication     | Ed25519 signatures over session ID + ephemeral pubkey  |
+| Forward secrecy           | Ephemeral X25519 key exchange per session              |
+| Replay protection         | RFC 6479 sliding window (128 packets), two-phase       |
+| Key separation            | HKDF derives independent c→s and s→c keys             |
+| Nonce uniqueness          | session_id[0..4] ‖ seq_u64_be — unique per packet     |
+| AAD coverage              | session_id ‖ seq committed into every AEAD tag         |
+| HELLO replay defence      | ±30 s timestamp validation on all HELLO packets        |
+| DoS — HELLO flood         | 10 HELLO/IP/s rate limit before any crypto runs        |
+| DoS — session exhaustion  | MAX_SESSIONS hard cap with ERROR reply                 |
+| Dead session cleanup      | Idle sessions evicted automatically after 45 s         |
 
 ### Known Limitations
 
-- No certificate infrastructure — signing keys distributed out-of-band or TOFU
-- No congestion control or retransmission (UDP, fire-and-forget by design)
-- No fragmentation — payloads over 1280 bytes must be split by the caller
-- In-band key update (KEY_UPDATE) defined in spec, not yet implemented
-- RESET and PING packet types wired up, handling not yet implemented
-- **Not audited**
+- No certificate infrastructure — signing keys distributed out-of-band or TOFU; no revocation
+- No retransmission — UDP packet loss is permanent; callers must handle reliability themselves
+- No congestion control — fire-and-forget; can saturate links
+- No fragmentation — payloads over 1 280 bytes must be split by the caller
+- In-band key update (KEY_UPDATE / KEY_UPDATE_ACK) defined in spec, not yet implemented
+- RESET, PING, PONG packet types defined on the wire, handling not yet implemented
+- **Not audited** — cryptographic usage has not been reviewed by a third party
 
 ---
 
