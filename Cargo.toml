@@ -5,6 +5,9 @@ members = [
     "smrp-server",
     "smrp-cli",
 ]
+exclude = [
+    "smrp-core/fuzz",
+]
 
 [workspace.package]
 version     = "0.1.0"

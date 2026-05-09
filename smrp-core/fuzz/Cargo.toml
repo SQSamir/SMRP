@@ -1,0 +1,32 @@
+[workspace]
+
+[package]
+name    = "smrp-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+smrp-core     = { path = ".." }
+
+[[bin]]
+name = "fuzz_packet_parse"
+path = "fuzz_targets/fuzz_packet_parse.rs"
+test = false
+doc  = false
+
+[[bin]]
+name = "fuzz_hello_payload"
+path = "fuzz_targets/fuzz_hello_payload.rs"
+test = false
+doc  = false
+
+[[bin]]
+name = "fuzz_replay_window"
+path = "fuzz_targets/fuzz_replay_window.rs"
+test = false
+doc  = false

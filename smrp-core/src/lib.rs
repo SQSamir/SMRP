@@ -5,11 +5,13 @@
 //! `smrp-core` — shared types, crypto, transport, and handshake logic for the
 //! Secure Minimal Reliable Protocol.
 
+pub mod config;
 pub mod conn;
 pub mod constants;
 pub mod crypto;
 pub mod error;
 pub mod handshake;
+pub mod metrics;
 pub mod packet;
 pub mod replay;
 pub mod session;
