@@ -88,7 +88,7 @@ impl Flags {
         self.0 & Self::FIN != 0
     }
 
-    /// Returns `true` when the KEY_UPDATE_REQUESTED bit is set.
+    /// Returns `true` when the `KEY_UPDATE_REQUESTED` bit is set.
     #[must_use]
     pub fn key_update_requested(self) -> bool {
         self.0 & Self::KEY_UPDATE_REQUESTED != 0
@@ -131,7 +131,7 @@ pub struct SmrpHeader {
     pub version: u8,
     /// Identifies the role and purpose of this packet.
     pub packet_type: PacketType,
-    /// Per-packet control bits (FIN, KEY_UPDATE_REQUESTED, …).
+    /// Per-packet control bits (FIN, `KEY_UPDATE_REQUESTED`, …).
     pub flags: Flags,
     /// Reserved for future use; senders MUST set to zero.
     pub reserved: u8,
@@ -149,6 +149,7 @@ pub struct SmrpHeader {
 
 /// Parses the first [`HEADER_LEN`] bytes of `src` into an [`SmrpHeader`].
 ///
+/// # Errors
 /// Returns [`SmrpError::MalformedHeader`] if `src` is shorter than
 /// `HEADER_LEN`, [`SmrpError::InvalidMagic`] on a magic mismatch, and
 /// [`SmrpError::UnsupportedVersion`] if the version byte is not `SMRP_VERSION`.

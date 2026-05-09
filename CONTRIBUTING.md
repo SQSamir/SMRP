@@ -31,9 +31,9 @@ Good first issues:
 
 Out of scope (for now):
 
-- Retransmission / reliability layer (out of design charter)
 - TLS or DTLS compatibility
 - Certificate authorities or X.509
+- Congestion control
 
 ## Pull Request Checklist
 

@@ -34,7 +34,7 @@ pub struct SmrpConfig {
     /// Default timeout for [`SmrpConnection::recv`]. Default: 60 s.
     pub recv_timeout: Duration,
 
-    /// How long [`SmrpConnection::close`] waits for a FIN_ACK. Default: 5 s.
+    /// How long [`SmrpConnection::close`] waits for a `FIN_ACK`. Default: 5 s.
     pub fin_ack_timeout: Duration,
 
     /// Capacity of the per-session packet channel. Default: 256 packets.

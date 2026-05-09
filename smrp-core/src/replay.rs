@@ -7,7 +7,7 @@
 ///
 /// The check and the mark are intentionally separated so that a failed AEAD
 /// decryption does NOT permanently consume the sequence number slot.
-/// This prevents a trivial DoS where an attacker injects a forged packet with
+/// This prevents a trivial `DoS` where an attacker injects a forged packet with
 /// a valid-looking sequence number, causing the legitimate retransmission to
 /// be rejected as a replay.
 ///

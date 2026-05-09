@@ -1,6 +1,6 @@
 /// SMRP handshake helpers shared by both client and server.
 ///
-/// Wire layout of the HELLO / HELLO_ACK payload (128 bytes, unencrypted):
+/// Wire layout of the HELLO / `HELLO_ACK` payload (128 bytes, unencrypted):
 /// ```text
 /// [0..32]   ephemeral X25519 public key
 /// [32..64]  Ed25519 signing public key
@@ -27,7 +27,7 @@ const HELLO_PAYLOAD_LEN: usize = 32 + 32 + 64;
 fn build_hello_payload(
     eph: &EphemeralKeypair,
     sign_key: &SigningKey,
-    session_id: &SessionId,
+    session_id: SessionId,
 ) -> Vec<u8> {
     let eph_pub = eph.public_key_bytes();
     let sign_pub = sign_key.public_key_bytes();
@@ -46,7 +46,7 @@ fn build_hello_payload(
 
 fn parse_hello_payload(
     payload: &[u8],
-    session_id: &SessionId,
+    session_id: SessionId,
 ) -> Result<([u8; 32], [u8; 32]), SmrpError> {
     if payload.len() < HELLO_PAYLOAD_LEN {
         return Err(SmrpError::MalformedHeader);
@@ -68,7 +68,7 @@ fn parse_hello_payload(
 
 fn derive_keys(
     shared: &[u8; 32],
-    session_id: &SessionId,
+    session_id: SessionId,
 ) -> Result<([u8; 32], [u8; 32]), SmrpError> {
     let salt = session_id.as_bytes().as_ref();
     let c2s = crypto::hkdf_sha256(shared, salt, b"smrp-v1-c2s")?;
@@ -115,7 +115,7 @@ pub async fn client_handshake(
 ) -> Result<Session, SmrpError> {
     let eph = EphemeralKeypair::generate()?;
     let session_id = SessionId::generate()?;
-    let payload = build_hello_payload(&eph, sign_key, &session_id);
+    let payload = build_hello_payload(&eph, sign_key, session_id);
 
     let hello_hdr = make_header(PacketType::Hello, session_id, 0, 0, payload.len());
     transport::send_raw(socket, server_addr, &hello_hdr, &payload).await?;
@@ -127,10 +127,10 @@ pub async fn client_handshake(
     }
 
     let (server_eph_pub, server_sign_pub) =
-        parse_hello_payload(&ack_payload, &session_id)?;
+        parse_hello_payload(&ack_payload, session_id)?;
 
     let shared = eph.agree(&server_eph_pub)?;
-    let (c2s_raw, s2c_raw) = derive_keys(&shared, &session_id)?;
+    let (c2s_raw, s2c_raw) = derive_keys(&shared, session_id)?;
 
     Ok(Session {
         id: session_id,
@@ -164,13 +164,13 @@ pub async fn server_handshake(
     server_sign_key: &SigningKey,
 ) -> Result<Session, SmrpError> {
     let (client_eph_pub, client_sign_pub) =
-        parse_hello_payload(hello_payload, &session_id)?;
+        parse_hello_payload(hello_payload, session_id)?;
 
     let server_eph = EphemeralKeypair::generate()?;
-    let ack_payload = build_hello_payload(&server_eph, server_sign_key, &session_id);
+    let ack_payload = build_hello_payload(&server_eph, server_sign_key, session_id);
 
     let shared = server_eph.agree(&client_eph_pub)?;
-    let (c2s_raw, s2c_raw) = derive_keys(&shared, &session_id)?;
+    let (c2s_raw, s2c_raw) = derive_keys(&shared, session_id)?;
 
     let ack_hdr = make_header(PacketType::HelloAck, session_id, 0, 0, ack_payload.len());
     transport::send_raw(socket, client_addr, &ack_hdr, &ack_payload).await?;

@@ -62,7 +62,7 @@ type Pkt = (SmrpHeader, Vec<u8>);
 
 /// Per-session routing entry stored in the listener's session map.
 struct SessionEntry {
-    /// Channel into the server-side SmrpConnection's receive loop.
+    /// Channel into the server-side `SmrpConnection`'s receive loop.
     data_tx:   mpsc::Sender<Pkt>,
     /// UDP address of the remote peer (needed to send FINs during shutdown).
     peer_addr: SocketAddr,
@@ -76,7 +76,7 @@ type SessionMap = Arc<tokio::sync::Mutex<HashMap<SessionId, SessionEntry>>>;
 
 /// A DATA packet waiting for its ACK.
 struct RetransmitEntry {
-    /// Copy of the header used to re-send (timestamp_us updated on each retry).
+    /// Copy of the header used to re-send (`timestamp_us` updated on each retry).
     header:    SmrpHeader,
     /// Already-encrypted ciphertext + 16-byte Poly1305 tag.
     ciphertext: Vec<u8>,
@@ -87,43 +87,46 @@ struct RetransmitEntry {
 }
 
 /// Jacobson/Karels RTT estimator that drives the retransmission timeout.
+/// All stored values are in microseconds.
 struct RttEstimator {
-    srtt_us:    f64,
-    rttvar_us:  f64,
-    rto_us:     u64,
-    rto_min_us: u64,
-    rto_max_us: u64,
+    srtt:    f64,  // smoothed RTT
+    rttvar:  f64,  // RTT variance
+    current: u64,  // current RTO
+    floor:   u64,  // minimum RTO
+    ceiling: u64,  // maximum RTO
 }
 
 impl RttEstimator {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     fn new(initial: Duration, min: Duration, max: Duration) -> Self {
-        let init_us = initial.as_micros() as f64;
+        let init = initial.as_micros() as u64;
+        let init_f = init as f64;
         Self {
-            srtt_us:    init_us,
-            rttvar_us:  init_us / 4.0,
-            rto_us:     initial.as_micros() as u64,
-            rto_min_us: min.as_micros() as u64,
-            rto_max_us: max.as_micros() as u64,
+            srtt:    init_f,
+            rttvar:  init_f / 4.0,
+            current: init,
+            floor:   min.as_micros() as u64,
+            ceiling: max.as_micros() as u64,
         }
     }
 
-    /// Updates the estimator with a new RTT sample.
+    /// Updates the estimator with a new RTT sample (Jacobson/Karels: α=1/8, β=1/4).
+    #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     fn update(&mut self, rtt_us: u64) {
         let r = rtt_us as f64;
-        // Jacobson/Karels: α=1/8, β=1/4
-        self.rttvar_us = 0.75 * self.rttvar_us + 0.25 * (r - self.srtt_us).abs();
-        self.srtt_us   = 0.875 * self.srtt_us   + 0.125 * r;
-        let rto = self.srtt_us + 4.0 * self.rttvar_us;
-        self.rto_us = (rto as u64).clamp(self.rto_min_us, self.rto_max_us);
+        self.rttvar = 0.75 * self.rttvar + 0.25 * (r - self.srtt).abs();
+        self.srtt   = 0.875 * self.srtt   + 0.125 * r;
+        let rto = (self.srtt + 4.0 * self.rttvar).max(0.0) as u64;
+        self.current = rto.clamp(self.floor, self.ceiling);
     }
 
-    /// Doubles the RTO (exponential backoff), capped at `rto_max`.
+    /// Doubles the RTO (exponential backoff), capped at the ceiling.
     fn backoff(&mut self) {
-        self.rto_us = (self.rto_us * 2).min(self.rto_max_us);
+        self.current = (self.current * 2).min(self.ceiling);
     }
 
     fn rto(&self) -> Duration {
-        Duration::from_micros(self.rto_us)
+        Duration::from_micros(self.current)
     }
 }
 
@@ -178,11 +181,19 @@ impl SmrpConnection {
     // --- Public constructors ---
 
     /// Opens an SMRP connection to `server_addr` using default configuration.
+    ///
+    /// # Errors
+    /// Returns [`SmrpError::HandshakeTimeout`] if the server does not respond
+    /// within `cfg.connect_timeout`, or any other [`SmrpError`] on failure.
     pub async fn connect(server_addr: &str) -> Result<Self, SmrpError> {
         Self::connect_with_config(server_addr, Arc::new(SmrpConfig::default())).await
     }
 
     /// Opens an SMRP connection using a custom [`SmrpConfig`].
+    ///
+    /// # Errors
+    /// Returns [`SmrpError::HandshakeTimeout`] if the server does not respond
+    /// within `cfg.connect_timeout`, or any other [`SmrpError`] on failure.
     pub async fn connect_with_config(
         server_addr: &str,
         cfg: Arc<SmrpConfig>,
@@ -360,13 +371,20 @@ impl SmrpConnection {
     /// Waits for the next DATA packet (up to `cfg.recv_timeout`).
     ///
     /// Returns `Ok(None)` on FIN, RESET, graceful shutdown, or dead-session eviction.
-    /// Returns `Err(HandshakeTimeout)` if nothing arrives within the deadline.
+    ///
+    /// # Errors
+    /// Returns [`SmrpError::HandshakeTimeout`] if nothing arrives within `cfg.recv_timeout`.
+    /// Returns [`SmrpError::AuthenticationFailure`] on AEAD tag mismatch.
     pub async fn recv(&mut self) -> Result<Option<Vec<u8>>, SmrpError> {
         let deadline = self.cfg.recv_timeout;
         self.recv_timeout(deadline).await
     }
 
     /// Like [`recv`](Self::recv) but with a caller-supplied deadline.
+    ///
+    /// # Errors
+    /// Returns [`SmrpError::HandshakeTimeout`] if nothing arrives within `deadline`.
+    /// Returns [`SmrpError::AuthenticationFailure`] on AEAD tag mismatch.
     pub async fn recv_timeout(&mut self, deadline: Duration) -> Result<Option<Vec<u8>>, SmrpError> {
         time::timeout(deadline, self.recv_inner())
             .await
@@ -386,7 +404,7 @@ impl SmrpConnection {
                         PacketType::Data => {
                             let seq = hdr.sequence_number;
 
-                            if let Err(_) = self.recv_replay.can_accept(seq) {
+                            if self.recv_replay.can_accept(seq).is_err() {
                                 self.metrics.replay_detections.fetch_add(1, Ordering::Relaxed);
                                 // Likely a retransmit: peer didn't receive our ACK.
                                 // Send a courtesy ACK so the peer stops retransmitting.
@@ -400,9 +418,8 @@ impl SmrpConnection {
                             aad[8..16].copy_from_slice(&seq.to_be_bytes());
 
                             let plaintext = self.recv_key.open(&nonce, &aad, &payload)
-                                .map_err(|e| {
+                                .inspect_err(|_| {
                                     self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
-                                    e
                                 })?;
 
                             self.recv_replay.mark_seen(seq);
@@ -438,9 +455,7 @@ impl SmrpConnection {
                             return Ok(None);
                         }
 
-                        PacketType::Keepalive   => { let _ = self.send_keepalive_ack().await; }
-                        PacketType::KeepaliveAck => {}
-                        PacketType::FinAck       => {}
+                        PacketType::Keepalive => { let _ = self.send_keepalive_ack().await; }
 
                         PacketType::Ping => {
                             let _ = self.send_pong(hdr.sequence_number, hdr.timestamp_us).await;
@@ -465,7 +480,10 @@ impl SmrpConnection {
         }
     }
 
-    /// Sends FIN, waits up to `cfg.fin_ack_timeout` for FIN_ACK, then releases.
+    /// Sends FIN, waits up to `cfg.fin_ack_timeout` for `FIN_ACK`, then releases.
+    ///
+    /// # Errors
+    /// Returns [`SmrpError::InternalError`] on socket failure sending the FIN.
     pub async fn close(mut self) -> Result<(), SmrpError> {
         self.send_fin_flag().await?;
         let timeout = self.cfg.fin_ack_timeout;
@@ -579,7 +597,7 @@ fn spawn_keepalive_task(
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = time::sleep(probe_interval) => {
+                () = time::sleep(probe_interval) => {
                     let now_us  = timestamp_us();
                     let last_us = last_recv_us.load(Ordering::Relaxed);
 
@@ -624,6 +642,7 @@ fn spawn_keepalive_task(
 // Retransmit task
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_retransmit_task(
     socket:          Arc<UdpSocket>,
     peer_addr:       SocketAddr,
@@ -638,7 +657,7 @@ fn spawn_retransmit_task(
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = time::sleep(check_interval) => {
+                () = time::sleep(check_interval) => {
                     let mut state = buf.lock().await;
                     let rto = state.rtt.rto();
                     let now = Instant::now();
@@ -647,7 +666,7 @@ fn spawn_retransmit_task(
                     let mut expired: Vec<u64> = Vec::new();
                     let mut dead = false;
 
-                    for (&seq, entry) in state.pending.iter() {
+                    for (&seq, entry) in &state.pending {
                         if now.duration_since(entry.sent_at) < rto { continue; }
                         if entry.retries >= max_retransmits {
                             warn!("session {session_id:?}: max retransmits ({max_retransmits}) for seq={seq} — session dead");
@@ -711,7 +730,7 @@ pub struct SmrpListener {
     new_conn_rx: mpsc::Receiver<SmrpConnection>,
     /// Drop or send on this to stop the dispatch loop.
     shutdown_tx: mpsc::Sender<()>,
-    /// Shared with the dispatch task; holds peer_addr per session for shutdown.
+    /// Shared with the dispatch task; holds `peer_addr` per session for shutdown.
     sessions:    SessionMap,
     cfg:         Arc<SmrpConfig>,
     metrics:     Arc<SmrpMetrics>,
@@ -719,6 +738,9 @@ pub struct SmrpListener {
 
 impl SmrpListener {
     /// Binds a UDP socket on `addr` using default configuration.
+    ///
+    /// # Errors
+    /// Returns [`SmrpError::InternalError`] if the socket cannot be bound.
     pub async fn bind(addr: &str) -> Result<Self, SmrpError> {
         Self::bind_with_config(addr, Arc::new(SmrpConfig::default())).await
     }
@@ -727,6 +749,10 @@ impl SmrpListener {
     ///
     /// Generates a fresh ephemeral signing key for this listener.
     /// To use a persistent identity key, call [`bind_with_config_and_key`](Self::bind_with_config_and_key).
+    ///
+    /// # Errors
+    /// Returns [`SmrpError::InternalError`] if the socket cannot be bound or
+    /// the signing key cannot be generated.
     pub async fn bind_with_config(addr: &str, cfg: Arc<SmrpConfig>) -> Result<Self, SmrpError> {
         let sign_key = SigningKey::generate()?;
         Self::bind_with_config_and_key(addr, cfg, sign_key).await
@@ -737,6 +763,9 @@ impl SmrpListener {
     ///
     /// Use this to load a persistent Ed25519 identity from disk so that
     /// clients can pin the server's public key fingerprint across restarts.
+    ///
+    /// # Errors
+    /// Returns [`SmrpError::InternalError`] if the socket cannot be bound.
     pub async fn bind_with_config_and_key(
         addr:     &str,
         cfg:      Arc<SmrpConfig>,
@@ -834,6 +863,54 @@ impl RateBucket {
     }
 }
 
+// Spawns the per-HELLO async task that runs the server handshake and registers
+// the new session. Extracted to keep `listener_dispatch` under the line limit.
+#[allow(clippy::too_many_arguments)]
+fn spawn_hello_handler(
+    addr:         SocketAddr,
+    payload:      Vec<u8>,
+    sid:          SessionId,
+    socket:       Arc<UdpSocket>,
+    sign_key:     Arc<SigningKey>,
+    sessions:     SessionMap,
+    new_conn_tx:  mpsc::Sender<SmrpConnection>,
+    dead_sess_tx: mpsc::Sender<SessionId>,
+    cfg:          Arc<SmrpConfig>,
+    metrics:      Arc<SmrpMetrics>,
+) {
+    tokio::spawn(async move {
+        let session = match handshake::server_handshake(
+            &socket, addr, sid, &payload, &sign_key,
+        ).await {
+            Ok(s)  => s,
+            Err(e) => { warn!("handshake with {addr} failed: {e}"); return; }
+        };
+
+        let cap = cfg.session_channel_capacity;
+        let (data_tx, data_rx) = mpsc::channel(cap);
+        let conn_sid = session.id;
+
+        let conn = match SmrpConnection::from_server_session(
+            session, socket, data_rx, cfg, Arc::clone(&metrics), dead_sess_tx,
+        ) {
+            Ok(c)  => c,
+            Err(e) => { warn!("connection assembly failed: {e}"); return; }
+        };
+
+        metrics.sessions_active.fetch_add(1, Ordering::Relaxed);
+        metrics.sessions_total.fetch_add(1, Ordering::Relaxed);
+
+        sessions.lock().await.insert(conn_sid, SessionEntry {
+            data_tx,
+            peer_addr: addr,
+        });
+
+        if new_conn_tx.send(conn).await.is_err() {
+            sessions.lock().await.remove(&conn_sid);
+        }
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn listener_dispatch(
     socket:           Arc<UdpSocket>,
@@ -889,46 +966,12 @@ async fn listener_dispatch(
                             }
                         }
 
-                        let socket2       = Arc::clone(&socket);
-                        let sign_key2     = Arc::clone(&sign_key);
-                        let sessions2     = Arc::clone(&sessions);
-                        let new_conn_tx2  = new_conn_tx.clone();
-                        let dead_sess_tx2 = dead_session_tx.clone();
-                        let cfg2          = Arc::clone(&cfg);
-                        let metrics2      = Arc::clone(&metrics);
-                        let sid           = hdr.session_id;
-
-                        tokio::spawn(async move {
-                            let session = match handshake::server_handshake(
-                                &socket2, addr, sid, &payload, &sign_key2,
-                            ).await {
-                                Ok(s)  => s,
-                                Err(e) => { warn!("handshake with {addr} failed: {e}"); return; }
-                            };
-
-                            let cap = cfg2.session_channel_capacity;
-                            let (data_tx, data_rx) = mpsc::channel(cap);
-                            let conn_sid = session.id;
-
-                            let conn = match SmrpConnection::from_server_session(
-                                session, socket2, data_rx, cfg2, Arc::clone(&metrics2), dead_sess_tx2,
-                            ) {
-                                Ok(c)  => c,
-                                Err(e) => { warn!("connection assembly failed: {e}"); return; }
-                            };
-
-                            metrics2.sessions_active.fetch_add(1, Ordering::Relaxed);
-                            metrics2.sessions_total.fetch_add(1, Ordering::Relaxed);
-
-                            sessions2.lock().await.insert(conn_sid, SessionEntry {
-                                data_tx,
-                                peer_addr: addr,
-                            });
-
-                            if new_conn_tx2.send(conn).await.is_err() {
-                                sessions2.lock().await.remove(&conn_sid);
-                            }
-                        });
+                        spawn_hello_handler(
+                            addr, payload, hdr.session_id,
+                            Arc::clone(&socket), Arc::clone(&sign_key),
+                            Arc::clone(&sessions), new_conn_tx.clone(),
+                            dead_session_tx.clone(), Arc::clone(&cfg), Arc::clone(&metrics),
+                        );
                     }
 
                     PacketType::Data | PacketType::Fin | PacketType::FinAck
