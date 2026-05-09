@@ -42,21 +42,43 @@ pub struct SmrpConfig {
 
     /// Capacity of the new-connection queue returned by `accept()`. Default: 64.
     pub accept_queue_capacity: usize,
+
+    // ---- Retransmission -------------------------------------------------------
+
+    /// Maximum number of retransmission attempts per DATA packet before the
+    /// session is declared dead. Default: 5.
+    pub max_retransmits: u32,
+
+    /// Initial retransmission timeout (RTO). The RTO is adjusted dynamically
+    /// using the Jacobson/Karels algorithm. Default: 200 ms.
+    pub rto_initial: Duration,
+
+    /// Minimum retransmission timeout (floor for exponential backoff).
+    /// Also used as the retransmit-task check interval. Default: 50 ms.
+    pub rto_min: Duration,
+
+    /// Maximum retransmission timeout (ceiling for exponential backoff).
+    /// Default: 30 s.
+    pub rto_max: Duration,
 }
 
 impl Default for SmrpConfig {
     fn default() -> Self {
         Self {
-            keepalive_interval:      Duration::from_secs(15),
-            session_dead_timeout:    Duration::from_secs(45),
-            hello_clock_skew:        Duration::from_secs(30),
-            hello_rate_limit:        10,
-            max_sessions:            100_000,
-            connect_timeout:         Duration::from_secs(10),
-            recv_timeout:            Duration::from_secs(60),
-            fin_ack_timeout:         Duration::from_secs(5),
+            keepalive_interval:       Duration::from_secs(15),
+            session_dead_timeout:     Duration::from_secs(45),
+            hello_clock_skew:         Duration::from_secs(30),
+            hello_rate_limit:         10,
+            max_sessions:             100_000,
+            connect_timeout:          Duration::from_secs(10),
+            recv_timeout:             Duration::from_secs(60),
+            fin_ack_timeout:          Duration::from_secs(5),
             session_channel_capacity: 256,
-            accept_queue_capacity:   64,
+            accept_queue_capacity:    64,
+            max_retransmits:          5,
+            rto_initial:              Duration::from_millis(200),
+            rto_min:                  Duration::from_millis(50),
+            rto_max:                  Duration::from_secs(30),
         }
     }
 }

@@ -28,7 +28,7 @@ pub struct SmrpMetrics {
     pub hello_drops_capacity: AtomicU64,
 
     // ---- Data plane -------------------------------------------------------
-    /// DATA packets successfully sent.
+    /// DATA packets successfully sent (first transmission only).
     pub packets_sent: AtomicU64,
     /// DATA packets successfully received and authenticated.
     pub packets_received: AtomicU64,
@@ -36,6 +36,8 @@ pub struct SmrpMetrics {
     pub bytes_sent: AtomicU64,
     /// Application bytes received (plaintext).
     pub bytes_received: AtomicU64,
+    /// DATA packets retransmitted due to missing ACK within RTO.
+    pub packets_retransmitted: AtomicU64,
 
     // ---- Security events -------------------------------------------------
     /// Packets whose AEAD tag failed verification.
@@ -69,6 +71,7 @@ impl SmrpMetrics {
             packets_received:        self.packets_received.load(Ordering::Relaxed),
             bytes_sent:              self.bytes_sent.load(Ordering::Relaxed),
             bytes_received:          self.bytes_received.load(Ordering::Relaxed),
+            packets_retransmitted:   self.packets_retransmitted.load(Ordering::Relaxed),
             auth_failures:           self.auth_failures.load(Ordering::Relaxed),
             replay_detections:       self.replay_detections.load(Ordering::Relaxed),
         }
@@ -88,6 +91,7 @@ pub struct MetricsSnapshot {
     pub packets_received:        u64,
     pub bytes_sent:              u64,
     pub bytes_received:          u64,
+    pub packets_retransmitted:   u64,
     pub auth_failures:           u64,
     pub replay_detections:       u64,
 }

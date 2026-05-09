@@ -135,10 +135,12 @@ pub fn hkdf_sha256(ikm: &[u8; 32], salt: &[u8], info: &[u8]) -> Result<[u8; 32],
     Ok(out)
 }
 
-/// An Ed25519 signing key pair.
+/// An Ed25519 signing key pair with support for PKCS#8 persistence.
 pub struct SigningKey {
-    inner: ring_sig::Ed25519KeyPair,
+    inner:        ring_sig::Ed25519KeyPair,
     public_bytes: [u8; 32],
+    /// Raw PKCS#8 DER bytes — retained so the key can be saved to disk.
+    pkcs8_bytes:  Vec<u8>,
 }
 
 impl SigningKey {
@@ -148,13 +150,37 @@ impl SigningKey {
     /// Returns [`SmrpError::InternalError`] if the RNG is unavailable.
     pub fn generate() -> Result<Self, SmrpError> {
         let rng = rand::SystemRandom::new();
-        let pkcs8 = ring_sig::Ed25519KeyPair::generate_pkcs8(&rng)
+        let pkcs8_doc = ring_sig::Ed25519KeyPair::generate_pkcs8(&rng)
             .map_err(|_| SmrpError::InternalError)?;
-        let inner = ring_sig::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
+        Self::from_pkcs8(pkcs8_doc.as_ref())
+    }
+
+    /// Loads a signing key from raw PKCS#8 DER bytes.
+    ///
+    /// Use this to restore a previously persisted key (see [`to_pkcs8`](Self::to_pkcs8)).
+    ///
+    /// # Errors
+    /// Returns [`SmrpError::InternalError`] if the bytes are not a valid
+    /// Ed25519 PKCS#8 document.
+    pub fn from_pkcs8(bytes: &[u8]) -> Result<Self, SmrpError> {
+        let inner = ring_sig::Ed25519KeyPair::from_pkcs8(bytes)
             .map_err(|_| SmrpError::InternalError)?;
         let mut public_bytes = [0u8; 32];
         public_bytes.copy_from_slice(inner.public_key().as_ref());
-        Ok(Self { inner, public_bytes })
+        Ok(Self {
+            inner,
+            public_bytes,
+            pkcs8_bytes: bytes.to_vec(),
+        })
+    }
+
+    /// Returns the raw PKCS#8 DER bytes for this key pair.
+    ///
+    /// Write these bytes to a file to persist the signing identity across
+    /// process restarts; reload with [`from_pkcs8`](Self::from_pkcs8).
+    #[must_use]
+    pub fn to_pkcs8(&self) -> &[u8] {
+        &self.pkcs8_bytes
     }
 
     /// Returns the 32-byte Ed25519 public key.

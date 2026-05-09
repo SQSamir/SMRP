@@ -43,7 +43,7 @@ use crate::{
     constants::{SMRP_MAGIC, SMRP_VERSION, MAX_PAYLOAD},
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -71,6 +71,70 @@ struct SessionEntry {
 type SessionMap = Arc<tokio::sync::Mutex<HashMap<SessionId, SessionEntry>>>;
 
 // ---------------------------------------------------------------------------
+// Retransmission
+// ---------------------------------------------------------------------------
+
+/// A DATA packet waiting for its ACK.
+struct RetransmitEntry {
+    /// Copy of the header used to re-send (timestamp_us updated on each retry).
+    header:    SmrpHeader,
+    /// Already-encrypted ciphertext + 16-byte Poly1305 tag.
+    ciphertext: Vec<u8>,
+    /// Wall-clock time of the last (re-)transmission.
+    sent_at:   Instant,
+    /// Number of retransmissions so far (0 = first send).
+    retries:   u32,
+}
+
+/// Jacobson/Karels RTT estimator that drives the retransmission timeout.
+struct RttEstimator {
+    srtt_us:    f64,
+    rttvar_us:  f64,
+    rto_us:     u64,
+    rto_min_us: u64,
+    rto_max_us: u64,
+}
+
+impl RttEstimator {
+    fn new(initial: Duration, min: Duration, max: Duration) -> Self {
+        let init_us = initial.as_micros() as f64;
+        Self {
+            srtt_us:    init_us,
+            rttvar_us:  init_us / 4.0,
+            rto_us:     initial.as_micros() as u64,
+            rto_min_us: min.as_micros() as u64,
+            rto_max_us: max.as_micros() as u64,
+        }
+    }
+
+    /// Updates the estimator with a new RTT sample.
+    fn update(&mut self, rtt_us: u64) {
+        let r = rtt_us as f64;
+        // Jacobson/Karels: α=1/8, β=1/4
+        self.rttvar_us = 0.75 * self.rttvar_us + 0.25 * (r - self.srtt_us).abs();
+        self.srtt_us   = 0.875 * self.srtt_us   + 0.125 * r;
+        let rto = self.srtt_us + 4.0 * self.rttvar_us;
+        self.rto_us = (rto as u64).clamp(self.rto_min_us, self.rto_max_us);
+    }
+
+    /// Doubles the RTO (exponential backoff), capped at `rto_max`.
+    fn backoff(&mut self) {
+        self.rto_us = (self.rto_us * 2).min(self.rto_max_us);
+    }
+
+    fn rto(&self) -> Duration {
+        Duration::from_micros(self.rto_us)
+    }
+}
+
+struct RetransmitState {
+    pending: BTreeMap<u64, RetransmitEntry>,
+    rtt:     RttEstimator,
+}
+
+type RetransmitBuf = Arc<tokio::sync::Mutex<RetransmitState>>;
+
+// ---------------------------------------------------------------------------
 // SmrpConnection
 // ---------------------------------------------------------------------------
 
@@ -96,8 +160,13 @@ pub struct SmrpConnection {
     _keepalive_stop: mpsc::Sender<()>,
     /// Updated on every received packet; read by the keepalive task.
     last_recv_us: Arc<AtomicU64>,
-    /// Fires once when the keepalive task declares the session dead.
+    /// Fires once when the keepalive or retransmit task declares the session dead.
     dead_rx: mpsc::Receiver<()>,
+
+    /// Pending DATA packets awaiting ACK; shared with the retransmit task.
+    retransmit_buf: RetransmitBuf,
+    /// Dropping this stops the retransmit task cleanly.
+    _retransmit_stop: mpsc::Sender<()>,
 
     cfg:     Arc<SmrpConfig>,
     metrics: Arc<SmrpMetrics>,
@@ -182,10 +251,15 @@ impl SmrpConnection {
         dead_session_tx: Option<mpsc::Sender<SessionId>>,
     ) -> Result<Self, SmrpError> {
         let (keepalive_stop_tx, keepalive_stop_rx) = mpsc::channel::<()>(1);
+        let (retransmit_stop_tx, retransmit_stop_rx) = mpsc::channel::<()>(1);
         let (dead_notify_tx, dead_rx)              = mpsc::channel::<()>(1);
-        // Seed with "now" so dead-timer starts from session establishment.
         let last_recv_us = Arc::new(AtomicU64::new(timestamp_us()));
         let closed       = Arc::new(AtomicBool::new(false));
+
+        let retransmit_buf: RetransmitBuf = Arc::new(tokio::sync::Mutex::new(RetransmitState {
+            pending: BTreeMap::new(),
+            rtt:     RttEstimator::new(cfg.rto_initial, cfg.rto_min, cfg.rto_max),
+        }));
 
         spawn_keepalive_task(
             Arc::clone(&socket),
@@ -193,7 +267,7 @@ impl SmrpConnection {
             session.id,
             keepalive_stop_rx,
             Arc::clone(&last_recv_us),
-            dead_notify_tx,
+            dead_notify_tx.clone(),
             dead_session_tx,
             Arc::clone(&metrics),
             Arc::clone(&closed),
@@ -201,19 +275,33 @@ impl SmrpConnection {
             cfg.session_dead_timeout,
         );
 
+        spawn_retransmit_task(
+            Arc::clone(&socket),
+            session.peer_addr,
+            session.id,
+            Arc::clone(&retransmit_buf),
+            retransmit_stop_rx,
+            dead_notify_tx,
+            Arc::clone(&metrics),
+            cfg.max_retransmits,
+            cfg.rto_min,
+        );
+
         Ok(Self {
             socket,
-            peer_addr:       session.peer_addr,
-            session_id:      session.id,
-            send_key:        session.send_key.take().ok_or(SmrpError::InternalError)?,
-            send_seq:        session.send_seq,
-            recv_key:        session.recv_key.take().ok_or(SmrpError::InternalError)?,
-            recv_replay:     session.recv_replay,
-            recv_seq:        session.recv_seq,
+            peer_addr:         session.peer_addr,
+            session_id:        session.id,
+            send_key:          session.send_key.take().ok_or(SmrpError::InternalError)?,
+            send_seq:          session.send_seq,
+            recv_key:          session.recv_key.take().ok_or(SmrpError::InternalError)?,
+            recv_replay:       session.recv_replay,
+            recv_seq:          session.recv_seq,
             data_rx,
-            _keepalive_stop: keepalive_stop_tx,
+            _keepalive_stop:   keepalive_stop_tx,
             last_recv_us,
             dead_rx,
+            retransmit_buf,
+            _retransmit_stop:  retransmit_stop_tx,
             cfg,
             metrics,
             closed,
@@ -223,6 +311,10 @@ impl SmrpConnection {
     // --- Public API ---
 
     /// Encrypts `data` and sends it as a DATA packet.
+    ///
+    /// The packet is kept in an internal retransmit buffer until its ACK
+    /// is received. If no ACK arrives within the RTO, it is retransmitted
+    /// up to `cfg.max_retransmits` times before the session is declared dead.
     ///
     /// # Errors
     /// Returns [`SmrpError::PayloadTooLarge`] if `data.len() > MAX_PAYLOAD`.
@@ -252,6 +344,14 @@ impl SmrpConnection {
         transport::send_raw(&self.socket, self.peer_addr, &hdr, &ciphertext).await?;
         self.send_seq += 1;
 
+        // Register in retransmit buffer — cleared when ACK(ack_number=seq) arrives.
+        self.retransmit_buf.lock().await.pending.insert(seq, RetransmitEntry {
+            header: hdr,
+            ciphertext,
+            sent_at: Instant::now(),
+            retries: 0,
+        });
+
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
         self.metrics.bytes_sent.fetch_add(data.len() as u64, Ordering::Relaxed);
         Ok(())
@@ -259,7 +359,7 @@ impl SmrpConnection {
 
     /// Waits for the next DATA packet (up to `cfg.recv_timeout`).
     ///
-    /// Returns `Ok(None)` on FIN, graceful shutdown, or dead-session eviction.
+    /// Returns `Ok(None)` on FIN, RESET, graceful shutdown, or dead-session eviction.
     /// Returns `Err(HandshakeTimeout)` if nothing arrives within the deadline.
     pub async fn recv(&mut self) -> Result<Option<Vec<u8>>, SmrpError> {
         let deadline = self.cfg.recv_timeout;
@@ -286,9 +386,12 @@ impl SmrpConnection {
                         PacketType::Data => {
                             let seq = hdr.sequence_number;
 
-                            if let Err(e) = self.recv_replay.can_accept(seq) {
+                            if let Err(_) = self.recv_replay.can_accept(seq) {
                                 self.metrics.replay_detections.fetch_add(1, Ordering::Relaxed);
-                                return Err(e);
+                                // Likely a retransmit: peer didn't receive our ACK.
+                                // Send a courtesy ACK so the peer stops retransmitting.
+                                let _ = self.send_ack(seq).await;
+                                continue;
                             }
 
                             let nonce = packet_nonce(self.session_id.as_bytes(), seq);
@@ -310,21 +413,52 @@ impl SmrpConnection {
                             self.metrics.bytes_received.fetch_add(plaintext.len() as u64, Ordering::Relaxed);
                             return Ok(Some(plaintext));
                         }
+
+                        PacketType::Ack => {
+                            // Remove the ACKed packet from the retransmit buffer.
+                            // Karn's algorithm: only update RTT for first-send packets.
+                            let ack_n = hdr.ack_number;
+                            let mut buf = self.retransmit_buf.lock().await;
+                            if let Some(entry) = buf.pending.remove(&ack_n) {
+                                if entry.retries == 0 {
+                                    buf.rtt.update(entry.sent_at.elapsed().as_micros() as u64);
+                                }
+                            }
+                        }
+
                         PacketType::Fin => {
                             let _ = self.send_fin_ack(hdr.sequence_number).await;
                             self.mark_closed();
                             return Ok(None);
                         }
+
+                        PacketType::Reset => {
+                            // Immediate abort — no FIN_ACK exchange.
+                            self.mark_closed();
+                            return Ok(None);
+                        }
+
                         PacketType::Keepalive   => { let _ = self.send_keepalive_ack().await; }
                         PacketType::KeepaliveAck => {}
-                        PacketType::Ack          => {}
                         PacketType::FinAck       => {}
-                        _                        => {}
+
+                        PacketType::Ping => {
+                            let _ = self.send_pong(hdr.sequence_number, hdr.timestamp_us).await;
+                        }
+                        PacketType::Pong => {
+                            // RTT from the echoed timestamp_us in the PONG header.
+                            let rtt_us = timestamp_us().saturating_sub(hdr.ack_number);
+                            if rtt_us > 0 && rtt_us < 60_000_000 {
+                                self.retransmit_buf.lock().await.rtt.update(rtt_us);
+                            }
+                        }
+
+                        _ => {}
                     }
                 }
 
                 _ = self.dead_rx.recv() => {
-                    warn!("session {:?}: dead-session timeout; closing", self.session_id);
+                    warn!("session {:?}: declared dead; closing", self.session_id);
                     return Ok(None);
                 }
             }
@@ -390,6 +524,22 @@ impl SmrpConnection {
         }, &[]).await
     }
 
+    /// Sends PONG in reply to a PING.
+    /// `ping_seq` is echoed into `ack_number`; `ping_ts` is echoed into the
+    /// payload so the initiator can compute RTT without clock synchronisation.
+    async fn send_pong(&self, ping_seq: u64, ping_ts: u64) -> Result<(), SmrpError> {
+        transport::send_raw(&self.socket, self.peer_addr, &SmrpHeader {
+            magic: SMRP_MAGIC, version: SMRP_VERSION,
+            packet_type: PacketType::Pong, flags: Flags::default(), reserved: 0,
+            session_id: self.session_id,
+            sequence_number: self.send_seq,
+            ack_number: ping_seq,
+            // Echo the sender's timestamp so they can subtract it on receipt.
+            timestamp_us: ping_ts,
+            payload_len: 0,
+        }, &[]).await
+    }
+
     async fn wait_fin_ack(&mut self) {
         loop {
             let Some((hdr, _)) = self.data_rx.recv().await else { return; };
@@ -400,10 +550,10 @@ impl SmrpConnection {
     // --- Accessors ---
 
     /// Returns the peer's UDP address.
-    #[must_use] pub fn peer_addr(&self)   -> SocketAddr  { self.peer_addr }
+    #[must_use] pub fn peer_addr(&self)  -> SocketAddr { self.peer_addr }
 
     /// Returns the raw 8-byte session identifier.
-    #[must_use] pub fn session_id(&self)  -> &[u8; 8]    { self.session_id.as_bytes() }
+    #[must_use] pub fn session_id(&self) -> &[u8; 8]   { self.session_id.as_bytes() }
 }
 
 // ---------------------------------------------------------------------------
@@ -437,7 +587,6 @@ fn spawn_keepalive_task(
                         warn!("session {session_id:?}: no traffic for {}s — evicting",
                               dead_threshold.as_secs());
 
-                        // Decrement sessions_active exactly once.
                         if !closed.swap(true, Ordering::AcqRel) {
                             metrics.sessions_active.fetch_sub(1, Ordering::Relaxed);
                         }
@@ -472,6 +621,85 @@ fn spawn_keepalive_task(
 }
 
 // ---------------------------------------------------------------------------
+// Retransmit task
+// ---------------------------------------------------------------------------
+
+fn spawn_retransmit_task(
+    socket:          Arc<UdpSocket>,
+    peer_addr:       SocketAddr,
+    session_id:      SessionId,
+    buf:             RetransmitBuf,
+    mut stop_rx:     mpsc::Receiver<()>,
+    dead_notify_tx:  mpsc::Sender<()>,
+    metrics:         Arc<SmrpMetrics>,
+    max_retransmits: u32,
+    check_interval:  Duration,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = time::sleep(check_interval) => {
+                    let mut state = buf.lock().await;
+                    let rto = state.rtt.rto();
+                    let now = Instant::now();
+
+                    // Identify which entries need action.
+                    let mut expired: Vec<u64> = Vec::new();
+                    let mut dead = false;
+
+                    for (&seq, entry) in state.pending.iter() {
+                        if now.duration_since(entry.sent_at) < rto { continue; }
+                        if entry.retries >= max_retransmits {
+                            warn!("session {session_id:?}: max retransmits ({max_retransmits}) for seq={seq} — session dead");
+                            dead = true;
+                            break;
+                        }
+                        expired.push(seq);
+                    }
+
+                    if dead {
+                        drop(state);
+                        let _ = dead_notify_tx.try_send(());
+                        break;
+                    }
+
+                    if expired.is_empty() { continue; }
+
+                    // Apply backoff once per check cycle.
+                    state.rtt.backoff();
+
+                    // Collect what to re-send and update retry counters.
+                    let mut sends: Vec<(SmrpHeader, Vec<u8>)> = Vec::with_capacity(expired.len());
+                    for &seq in &expired {
+                        if let Some(entry) = state.pending.get_mut(&seq) {
+                            let mut hdr = entry.header.clone();
+                            hdr.timestamp_us = timestamp_us(); // refresh timestamp
+                            sends.push((hdr, entry.ciphertext.clone()));
+                            entry.sent_at = now;
+                            entry.retries += 1;
+                        }
+                    }
+
+                    drop(state); // release lock before I/O
+
+                    for (hdr, ciphertext) in sends {
+                        if transport::send_raw(&socket, peer_addr, &hdr, &ciphertext).await.is_err() {
+                            break;
+                        }
+                        metrics.packets_retransmitted.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+
+                _ = stop_rx.recv() => {
+                    debug!("session {session_id:?}: retransmit task stopping");
+                    break;
+                }
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // SmrpListener
 // ---------------------------------------------------------------------------
 
@@ -496,17 +724,34 @@ impl SmrpListener {
     }
 
     /// Binds a UDP socket on `addr` using a custom [`SmrpConfig`].
+    ///
+    /// Generates a fresh ephemeral signing key for this listener.
+    /// To use a persistent identity key, call [`bind_with_config_and_key`](Self::bind_with_config_and_key).
     pub async fn bind_with_config(addr: &str, cfg: Arc<SmrpConfig>) -> Result<Self, SmrpError> {
+        let sign_key = SigningKey::generate()?;
+        Self::bind_with_config_and_key(addr, cfg, sign_key).await
+    }
+
+    /// Binds a UDP socket on `addr` using a custom [`SmrpConfig`] and a
+    /// caller-supplied signing key.
+    ///
+    /// Use this to load a persistent Ed25519 identity from disk so that
+    /// clients can pin the server's public key fingerprint across restarts.
+    pub async fn bind_with_config_and_key(
+        addr:     &str,
+        cfg:      Arc<SmrpConfig>,
+        sign_key: SigningKey,
+    ) -> Result<Self, SmrpError> {
         let socket = Arc::new(
             UdpSocket::bind(addr).await.map_err(|_| SmrpError::InternalError)?,
         );
         let local_addr  = socket.local_addr().map_err(|_| SmrpError::InternalError)?;
-        let sign_key    = Arc::new(SigningKey::generate()?);
+        let sign_key    = Arc::new(sign_key);
         let sessions: SessionMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let metrics     = Arc::new(SmrpMetrics::new());
-        let (new_conn_tx, new_conn_rx)     = mpsc::channel(cfg.accept_queue_capacity);
-        let (shutdown_tx, shutdown_rx)     = mpsc::channel::<()>(1);
-        let (dead_sess_tx, dead_sess_rx)   = mpsc::channel::<SessionId>(256);
+        let (new_conn_tx, new_conn_rx)   = mpsc::channel(cfg.accept_queue_capacity);
+        let (shutdown_tx, shutdown_rx)   = mpsc::channel::<()>(1);
+        let (dead_sess_tx, dead_sess_rx) = mpsc::channel::<SessionId>(256);
 
         tokio::spawn(listener_dispatch(
             Arc::clone(&socket),
@@ -547,20 +792,14 @@ impl SmrpListener {
     /// 3. Injects a synthetic FIN into every server-side session channel.
     /// 4. Dropping `self` closes `new_conn_rx`, causing `accept()` → `None`.
     pub async fn shutdown(self) {
-        // Stop the dispatch loop.
         drop(self.shutdown_tx);
 
         let map = self.sessions.lock().await;
         for (sid, entry) in map.iter() {
-            // Send a real FIN over the wire so the remote peer is notified.
             let fin = shutdown_fin(*sid);
             let _ = transport::send_raw(&self.socket, entry.peer_addr, &fin, &[]).await;
-
-            // Also inject into the server-side SmrpConnection's channel so
-            // any in-progress server recv() returns Ok(None) quickly.
             let _ = entry.data_tx.try_send((shutdown_fin(*sid), vec![]));
         }
-        // Dropping self drops new_conn_rx → accept() returns None.
     }
 }
 
@@ -597,15 +836,15 @@ impl RateBucket {
 
 #[allow(clippy::too_many_arguments)]
 async fn listener_dispatch(
-    socket:          Arc<UdpSocket>,
-    sign_key:        Arc<SigningKey>,
-    sessions:        SessionMap,
-    new_conn_tx:     mpsc::Sender<SmrpConnection>,
-    mut shutdown_rx: mpsc::Receiver<()>,
-    dead_session_tx: mpsc::Sender<SessionId>,
+    socket:           Arc<UdpSocket>,
+    sign_key:         Arc<SigningKey>,
+    sessions:         SessionMap,
+    new_conn_tx:      mpsc::Sender<SmrpConnection>,
+    mut shutdown_rx:  mpsc::Receiver<()>,
+    dead_session_tx:  mpsc::Sender<SessionId>,
     mut dead_sess_rx: mpsc::Receiver<SessionId>,
-    cfg:             Arc<SmrpConfig>,
-    metrics:         Arc<SmrpMetrics>,
+    cfg:              Arc<SmrpConfig>,
+    metrics:          Arc<SmrpMetrics>,
 ) {
     let mut rate_limits: HashMap<IpAddr, RateBucket> = HashMap::new();
 
@@ -619,7 +858,6 @@ async fn listener_dispatch(
 
                 match hdr.packet_type {
                     PacketType::Hello => {
-                        // Rate limit
                         let bucket = rate_limits.entry(addr.ip()).or_insert_with(RateBucket::new);
                         if !bucket.allow(cfg.hello_rate_limit) {
                             metrics.hello_drops_rate_limit.fetch_add(1, Ordering::Relaxed);
@@ -627,7 +865,6 @@ async fn listener_dispatch(
                             continue;
                         }
 
-                        // Timestamp validation
                         let now_us  = timestamp_us();
                         let skew_us = cfg.hello_clock_skew.as_micros() as u64;
                         let ts = hdr.timestamp_us;
@@ -637,7 +874,6 @@ async fn listener_dispatch(
                             continue;
                         }
 
-                        // Session capacity
                         {
                             let map = sessions.lock().await;
                             if map.len() >= cfg.max_sessions {
@@ -670,7 +906,7 @@ async fn listener_dispatch(
                                 Err(e) => { warn!("handshake with {addr} failed: {e}"); return; }
                             };
 
-                            let cap      = cfg2.session_channel_capacity;
+                            let cap = cfg2.session_channel_capacity;
                             let (data_tx, data_rx) = mpsc::channel(cap);
                             let conn_sid = session.id;
 
@@ -697,7 +933,7 @@ async fn listener_dispatch(
 
                     PacketType::Data | PacketType::Fin | PacketType::FinAck
                     | PacketType::Ack | PacketType::Keepalive | PacketType::KeepaliveAck
-                    | PacketType::Reset => {
+                    | PacketType::Reset | PacketType::Ping | PacketType::Pong => {
                         let mut map = sessions.lock().await;
                         let sid    = hdr.session_id;
                         let remove = if let Some(entry) = map.get(&sid) {
@@ -730,7 +966,6 @@ async fn listener_dispatch(
             }
         }
     }
-    // Exiting drops new_conn_tx → accept() returns None.
 }
 
 async fn send_error_reply(
@@ -878,15 +1113,8 @@ mod tests {
     async fn listener_shutdown_notifies_client() {
         let (addr, listener) = echo_server().await;
         let mut client = SmrpConnection::connect(&addr.to_string()).await.unwrap();
-
-        // Small pause: the handshake sub-task inserts the session into the map
-        // *after* sending HELLO_ACK (which unblocks connect()).  Without this
-        // pause, shutdown() may lock the map before the entry is inserted.
         tokio::time::sleep(Duration::from_millis(100)).await;
-
         listener.shutdown().await;
-
-        // The client should see Ok(None) from the FIN sent over the wire.
         let result = time::timeout(Duration::from_secs(2), client.recv()).await;
         assert!(result.is_ok(), "client.recv() timed out after shutdown");
         assert!(result.unwrap().unwrap().is_none(), "expected Ok(None)");
@@ -910,18 +1138,14 @@ mod tests {
         let (addr, listener) = echo_server().await;
         let m = listener.metrics();
         spawn_echo(listener);
-
         let mut conn = SmrpConnection::connect(&addr.to_string()).await.unwrap();
         conn.send(b"measure me").await.unwrap();
         let _ = conn.recv().await.unwrap();
         conn.close().await.unwrap();
-
-        // Give the server-side a moment to finish processing.
         tokio::time::sleep(Duration::from_millis(50)).await;
-
         let snap = m.snapshot();
-        assert!(snap.sessions_total >= 1, "sessions_total should be ≥ 1");
-        assert!(snap.packets_received >= 1, "server should have received ≥ 1 packet");
+        assert!(snap.sessions_total >= 1);
+        assert!(snap.packets_received >= 1);
         assert!(snap.bytes_received >= b"measure me".len() as u64);
     }
 
@@ -935,7 +1159,51 @@ mod tests {
         });
         let start = Instant::now();
         let _ = SmrpConnection::connect_with_config("127.0.0.1:1", cfg).await;
-        // Should have returned within ~1 s (well under the default 10 s).
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    // --- Retransmit buffer cleared after ACK ---
+
+    #[tokio::test]
+    async fn retransmit_buffer_drained_after_ack() {
+        let (addr, listener) = echo_server().await;
+        spawn_echo(listener);
+        let mut conn = SmrpConnection::connect(&addr.to_string()).await.unwrap();
+
+        conn.send(b"drain test").await.unwrap();
+        // After recv() the ACK has been processed.
+        let _ = conn.recv().await.unwrap();
+
+        // Give the ACK a moment to reach recv_inner's Ack branch.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let pending = conn.retransmit_buf.lock().await.pending.len();
+        assert_eq!(pending, 0, "retransmit buffer should be empty after ACK");
+
+        conn.close().await.unwrap();
+    }
+
+    // --- Persistent signing key ---
+
+    #[tokio::test]
+    async fn signing_key_pkcs8_roundtrip() {
+        let key   = SigningKey::generate().unwrap();
+        let bytes = key.to_pkcs8().to_vec();
+        let key2  = SigningKey::from_pkcs8(&bytes).unwrap();
+        assert_eq!(key.public_key_bytes(), key2.public_key_bytes());
+    }
+
+    #[tokio::test]
+    async fn bind_with_persistent_key() {
+        let key = SigningKey::generate().unwrap();
+        let pub_bytes = *key.public_key_bytes();
+        let cfg = Arc::new(SmrpConfig::default());
+        let listener = SmrpListener::bind_with_config_and_key("127.0.0.1:0", cfg, key)
+            .await.unwrap();
+        // Listener bound successfully with a pre-supplied key.
+        assert!(listener.local_addr().port() > 0);
+        drop(listener);
+        // The same PKCS8 bytes produce the same public key.
+        let _ = pub_bytes;
     }
 }

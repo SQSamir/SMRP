@@ -20,14 +20,17 @@ a minimal, auditable implementation in safe Rust.
 - **HKDF-SHA-256 key derivation** — independent send/receive keys per direction
 - **Ed25519 handshake signatures** — mutual authentication without a PKI
 - **RFC 6479 anti-replay window** — 128-packet sliding window, two-phase DoS-safe design
+- **Reliable delivery** — per-packet retransmit buffer; Jacobson/Karels RTT estimator; exponential backoff; Karn's algorithm
+- **RESET / PING / PONG** — immediate abort, RTT probing (echoes timestamp_us for clock-free RTT measurement)
+- **Persistent signing identity** — Ed25519 PKCS#8 `to_pkcs8` / `from_pkcs8`; `bind_with_config_and_key` for stable server fingerprint
 - **Graceful teardown** — FIN / FIN_ACK exchange; configurable `fin_ack_timeout`
 - **Keepalive probes** — KEEPALIVE / KEEPALIVE_ACK every 15 s when idle (configurable)
 - **Dead session eviction** — sessions with no traffic for 45 s are freed automatically
 - **HELLO rate limiting** — 10 HELLO/IP/s; excess silently dropped before any crypto
 - **HELLO timestamp validation** — rejects stale or future handshake packets (±30 s)
 - **MAX_SESSIONS enforcement** — hard cap with ERROR reply to the client
-- **Configurable runtime parameters** — `SmrpConfig` controls all timeouts and limits
-- **Operational metrics** — `SmrpMetrics` exposes 12 atomic counters + snapshot API
+- **Configurable runtime parameters** — `SmrpConfig` controls all timeouts, limits, and retransmission behaviour
+- **Operational metrics** — `SmrpMetrics` exposes 13 atomic counters + snapshot API
 - **Graceful listener shutdown** — sends real FIN packets to all connected peers
 - **connect() / recv() timeouts** — never block forever; caller-configurable deadlines
 - **Async-first API** — built on Tokio, per-handshake concurrency
@@ -91,9 +94,9 @@ Offset  Size  Field
 | 0x09 | FIN            | Graceful teardown                          | Implemented |
 | 0x0A | ERROR          | Protocol error notification                | Implemented |
 | 0x0B | FIN_ACK        | Acknowledge FIN                            | Implemented |
-| 0x0C | RESET          | Immediate abort                            | Planned     |
-| 0x0D | PING           | RTT measurement request                    | Planned     |
-| 0x0E | PONG           | RTT measurement response                   | Planned     |
+| 0x0C | RESET          | Immediate abort                            | Implemented |
+| 0x0D | PING           | RTT measurement request                    | Implemented |
+| 0x0E | PONG           | RTT measurement response                   | Implemented |
 
 ---
 
@@ -174,6 +177,8 @@ let cfg = Arc::new(SmrpConfig {
     session_dead_timeout: Duration::from_secs(15),
     max_sessions:         1_000,
     recv_timeout:         Duration::from_secs(30),
+    max_retransmits:      8,
+    rto_initial:          Duration::from_millis(100),
     ..SmrpConfig::default()
 });
 
@@ -182,8 +187,31 @@ let metrics = listener.metrics();
 
 // Read a snapshot any time
 let snap = metrics.snapshot();
-println!("active={} total={} auth_failures={}",
-    snap.sessions_active, snap.sessions_total, snap.auth_failures);
+println!("active={} total={} retransmits={} auth_failures={}",
+    snap.sessions_active, snap.sessions_total,
+    snap.packets_retransmitted, snap.auth_failures);
+```
+
+### Persistent server identity
+
+```rust
+use smrp_core::{config::SmrpConfig, conn::SmrpListener, crypto::SigningKey};
+use std::{fs, path::Path, sync::Arc};
+
+const KEY_FILE: &str = "smrp_server.key";
+
+let sign_key = if Path::new(KEY_FILE).exists() {
+    SigningKey::from_pkcs8(&fs::read(KEY_FILE)?)?
+} else {
+    let key = SigningKey::generate()?;
+    fs::write(KEY_FILE, key.to_pkcs8())?;
+    key
+};
+println!("identity: {}", hex::encode(sign_key.public_key_bytes()));
+
+let mut listener = SmrpListener::bind_with_config_and_key(
+    "0.0.0.0:9000", Arc::new(SmrpConfig::default()), sign_key,
+).await?;
 ```
 
 ### Graceful shutdown
@@ -201,10 +229,10 @@ listener.shutdown().await;
 smrp/
 ├── smrp-core/          # Library: crypto, handshake, transport, high-level API
 │   ├── src/
-│   │   ├── conn.rs       # SmrpConnection / SmrpListener public API
-│   │   ├── config.rs     # SmrpConfig — runtime-tunable parameters
+│   │   ├── conn.rs       # SmrpConnection / SmrpListener — retransmit, RESET, PING/PONG
+│   │   ├── config.rs     # SmrpConfig — timeouts, limits, retransmission tuning
 │   │   ├── constants.rs  # Compile-time wire constants
-│   │   ├── crypto.rs     # X25519, ChaCha20-Poly1305, HKDF, Ed25519
+│   │   ├── crypto.rs     # X25519, ChaCha20-Poly1305, HKDF, Ed25519 + PKCS8 persistence
 │   │   ├── error.rs      # SmrpError enum + wire codes
 │   │   ├── handshake.rs  # Client/server handshake logic, key derivation
 │   │   ├── metrics.rs    # SmrpMetrics atomic counters + MetricsSnapshot
@@ -217,10 +245,10 @@ smrp/
 │           ├── fuzz_packet_parse.rs   # Arbitrary bytes → header parser
 │           ├── fuzz_hello_payload.rs  # Valid header + fuzz payload
 │           └── fuzz_replay_window.rs  # Arbitrary (seq, action) pairs
-├── smrp-server/        # Binary: reference echo server
+├── smrp-server/        # Binary: echo server with persistent signing key
 ├── smrp-cli/           # Binary: command-line client
 ├── docs/
-│   └── SPEC.md         # Full protocol specification (v0.3)
+│   └── SPEC.md         # Full protocol specification (v0.4)
 └── LICENSE
 ```
 
@@ -232,7 +260,7 @@ smrp/
 cargo test --workspace
 ```
 
-**49 tests** across all modules:
+**54 tests** across all modules:
 
 | Module      | Tests | Coverage                                                          |
 |-------------|-------|-------------------------------------------------------------------|
@@ -241,8 +269,9 @@ cargo test --workspace
 | `packet`    | 13    | Parse/serialize, all 14 packet types, flag bits                   |
 | `session`   | 3     | SessionId equality, state copy                                    |
 | `replay`    | 11    | In-order, replay, out-of-order, two-phase, window slide           |
-| `conn`      | 11    | Round-trip, concurrency, max payload, timeouts, FIN/FIN_ACK,      |
-|             |       | metrics, custom config, shutdown, no-accept-after-shutdown        |
+| `conn`      | 14    | Round-trip, concurrency, max payload, timeouts, FIN/FIN_ACK,      |
+|             |       | metrics, custom config, shutdown, no-accept-after-shutdown,       |
+|             |       | retransmit-buffer drain, PKCS8 roundtrip, persistent key bind     |
 | doc-tests   | 2     | API examples compile and run                                      |
 
 ### Running Fuzz Targets
@@ -282,15 +311,16 @@ cargo +nightly fuzz run fuzz_replay_window
 | DoS — HELLO flood         | 10 HELLO/IP/s rate limit before any crypto runs        |
 | DoS — session exhaustion  | MAX_SESSIONS hard cap with ERROR reply                 |
 | Dead session cleanup      | Idle sessions evicted automatically after 45 s         |
+| Server identity pinning   | Persistent Ed25519 key via PKCS#8; stable fingerprint  |
+| Reliable delivery         | Per-packet retransmit buffer; Jacobson/Karels RTO      |
 
 ### Known Limitations
 
 - No certificate infrastructure — signing keys distributed out-of-band or TOFU; no revocation
-- No retransmission — UDP packet loss is permanent; callers must handle reliability themselves
 - No congestion control — fire-and-forget; can saturate links
 - No fragmentation — payloads over 1 280 bytes must be split by the caller
 - In-band key update (KEY_UPDATE / KEY_UPDATE_ACK) defined in spec, not yet implemented
-- RESET, PING, PONG packet types defined on the wire, handling not yet implemented
+- Nonce uses only 32 bits of session ID entropy; full 64-bit session IDs are preferred at extreme session counts
 - **Not audited** — cryptographic usage has not been reviewed by a third party
 
 ---

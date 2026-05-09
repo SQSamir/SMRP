@@ -1,16 +1,14 @@
 # SMRP Protocol Specification
 
-**Version:** 0.3  
+**Version:** 0.4  
 **Status:** Draft  
 **Authors:** Samir Gasimov
 
-> **Changelog v0.2→v0.3:** FIN_ACK marked as implemented (was "planned");
-> corrected §10 teardown timeout (fin_ack_timeout, not keepalive × 3);
-> corrected §11 keepalive trigger (tracks last *received* packet, not sent);
-> removed unimplemented half-open session limit from §14;
-> expanded §13 to distinguish compile-time constants from runtime-configurable
-> defaults; added §15 (Implementation API — SmrpConfig, SmrpMetrics,
-> SmrpConnection, SmrpListener).
+> **Changelog v0.3→v0.4:** Retransmission implemented (§8.4) — removed from
+> Known Weaknesses; RESET, PING, PONG marked as implemented; added persistent
+> Ed25519 signing key API (§15.5); updated §13.2 with four new retransmission
+> config fields; updated §15 (SmrpConfig, SmrpMetrics, SmrpListener) to reflect
+> new API; corrected §8.3 ACK semantics to document retransmit-drain behaviour.
 
 ---
 
@@ -27,7 +25,7 @@ Design goals:
 - Auditable implementation — no custom crypto, rely on `ring`
 - Async-first implementation with Tokio
 
-Non-goals: congestion control, retransmission, fragmentation, PKI.
+Non-goals: congestion control, fragmentation, PKI.
 
 ---
 
@@ -104,9 +102,9 @@ Maximum on-wire packet: 54 + 1 280 + 16 = **1 350 bytes**.
 | 0x09 | FIN            | C↔S       | Graceful session teardown                      | Implemented |
 | 0x0A | ERROR          | C↔S       | Signal a protocol error to the peer            | Implemented |
 | 0x0B | FIN_ACK        | C↔S       | Acknowledge FIN; completes graceful teardown   | Implemented |
-| 0x0C | RESET          | C↔S       | Immediate session abort (no acknowledgement)   | Planned     |
-| 0x0D | PING           | C↔S       | RTT measurement request                        | Planned     |
-| 0x0E | PONG           | C↔S       | RTT measurement response                       | Planned     |
+| 0x0C | RESET          | C↔S       | Immediate session abort (no acknowledgement)   | Implemented |
+| 0x0D | PING           | C↔S       | RTT measurement request                        | Implemented |
+| 0x0E | PONG           | C↔S       | RTT measurement response                       | Implemented |
 
 ---
 
@@ -257,8 +255,71 @@ is effectively unbounded at typical data rates.
 After receiving a DATA packet the receiver sends an ACK with
 `ack_number = sequence_number` of the DATA just processed and no payload. The
 sender's `ack_number` field in DATA packets carries the cumulative ACK for the
-reverse direction. ACKs are informational in the current implementation — there
-is no retransmission.
+reverse direction. On receipt of an ACK the matching entry is removed from the
+sender's retransmit buffer (see §8.4).
+
+**Courtesy ACK on replay detection:** If the replay window rejects a DATA packet
+(sequence number already seen), the receiver still sends an ACK. This handles
+the common case where the peer did not receive the first ACK and is retransmitting.
+
+### 8.4 Retransmission
+
+SMRP implements per-packet reliable delivery using a retransmit buffer keyed by
+sequence number.
+
+**Algorithm:**
+
+1. When `send()` is called, the DATA packet (header + encrypted ciphertext) is
+   inserted into an in-memory retransmit buffer.
+2. A background retransmit task wakes every `rto_min` (default: 50 ms) and
+   inspects each pending entry.
+3. If `elapsed ≥ RTO`, the packet is re-sent with a refreshed `timestamp_us`
+   and the retry counter is incremented.
+4. After each retransmit cycle the RTO is doubled (exponential backoff), capped
+   at `rto_max`.
+5. If an entry's retry counter reaches `max_retransmits`, the session is
+   declared dead and `recv()` returns `Ok(None)`.
+6. When an ACK is received, the corresponding entry is removed from the buffer.
+
+**RTT Estimation (Jacobson/Karels):**
+
+```
+α = 1/8  (SRTT smoothing factor)
+β = 1/4  (RTTVAR smoothing factor)
+
+RTTVAR = (1-β)·RTTVAR + β·|SRTT - Ri|
+SRTT   = (1-α)·SRTT   + α·Ri
+RTO    = SRTT + 4·RTTVAR   (clamped to [rto_min, rto_max])
+```
+
+**Karn's algorithm:** RTT samples are only taken from DATA packets with
+`retries == 0` (first transmission). Retransmitted packets are excluded because
+it is ambiguous whether an ACK was triggered by the original or the retransmit.
+
+**Retransmission config fields** (all in `SmrpConfig`):
+
+| Field            | Default | Meaning                                          |
+|------------------|---------|--------------------------------------------------|
+| `max_retransmits`| 5       | Max retries per packet before session is dead    |
+| `rto_initial`    | 200 ms  | Starting RTO before any RTT samples              |
+| `rto_min`        | 50 ms   | Floor for RTO and retransmit-task check interval |
+| `rto_max`        | 30 s    | Ceiling for exponential backoff                  |
+
+### 8.5 RESET
+
+On receipt of a RESET packet the session is closed immediately. No FIN_ACK is
+exchanged. `recv()` returns `Ok(None)`. The sender of RESET does not wait for
+any acknowledgement.
+
+### 8.6 PING / PONG
+
+PING is a one-way RTT probe. The receiver replies with PONG, echoing the PING's
+`timestamp_us` into its own `timestamp_us` field and the PING's `sequence_number`
+into `ack_number`. The original sender subtracts the echoed timestamp from its
+current clock to compute the round-trip time without requiring clock
+synchronisation.
+
+The PONG RTT sample is fed into the same Jacobson/Karels estimator as DATA ACKs.
 
 ---
 
@@ -372,6 +433,10 @@ See §15.1 for the full API.
 | fin_ack_timeout         | 5 s        | How long close() waits for FIN_ACK             |
 | session_channel_capacity| 256 pkts   | Per-session in-flight packet buffer            |
 | accept_queue_capacity   | 64 conns   | New-connection queue depth at SmrpListener     |
+| max_retransmits         | 5          | Max retransmit attempts before session dead    |
+| rto_initial             | 200 ms     | Initial retransmission timeout                 |
+| rto_min                 | 50 ms      | Minimum RTO (also retransmit-task interval)    |
+| rto_max                 | 30 s       | Maximum RTO (exponential backoff ceiling)      |
 
 ---
 
@@ -414,11 +479,14 @@ Two-layer defence:
 
 - **No certificate infrastructure** — signing keys distributed out-of-band or
   TOFU; no revocation
-- **No retransmission** — UDP packet loss is permanent; callers must implement
-  their own reliability if needed
 - **No fragmentation** — callers must split payloads over MAX_PAYLOAD themselves
 - **No congestion control** — fire-and-forget by design; can saturate links
-- **KEY_UPDATE not implemented** — long sessions do not get automatic rekeying
+- **KEY_UPDATE not implemented** — long sessions do not get automatic rekeying;
+  packet types 0x07/0x08 are defined on the wire but not yet handled
+- **Nonce entropy** — the 12-byte nonce uses only 32 bits of session ID entropy;
+  within a session nonce uniqueness is guaranteed by the 64-bit sequence number,
+  but cross-session collision probability should be considered at very high
+  session counts
 - **Not audited** — cryptographic usage has not been reviewed by a third party
 
 ---
@@ -439,6 +507,10 @@ pub struct SmrpConfig {
     pub fin_ack_timeout:          Duration,  // default: 5 s
     pub session_channel_capacity: usize,     // default: 256
     pub accept_queue_capacity:    usize,     // default: 64
+    pub max_retransmits:          u32,       // default: 5
+    pub rto_initial:              Duration,  // default: 200 ms
+    pub rto_min:                  Duration,  // default: 50 ms
+    pub rto_max:                  Duration,  // default: 30 s
 }
 
 impl Default for SmrpConfig { ... }
@@ -468,6 +540,7 @@ pub struct SmrpMetrics {
     pub packets_received:         AtomicU64,
     pub bytes_sent:               AtomicU64,  // plaintext bytes
     pub bytes_received:           AtomicU64,  // plaintext bytes
+    pub packets_retransmitted:    AtomicU64,
 
     // Security events
     pub auth_failures:            AtomicU64,
@@ -485,8 +558,13 @@ via `load(Ordering::Relaxed)` for cheap one-shot reads.
 // Bind with default config
 async fn bind(addr: &str) -> Result<SmrpListener, SmrpError>
 
-// Bind with custom config
+// Bind with custom config (generates a fresh ephemeral signing key)
 async fn bind_with_config(addr: &str, cfg: Arc<SmrpConfig>) -> Result<SmrpListener, SmrpError>
+
+// Bind with a persistent caller-supplied Ed25519 signing key
+async fn bind_with_config_and_key(
+    addr: &str, cfg: Arc<SmrpConfig>, sign_key: SigningKey,
+) -> Result<SmrpListener, SmrpError>
 
 // Accept the next incoming connection (returns None after shutdown)
 async fn accept(&mut self) -> Option<SmrpConnection>
@@ -533,6 +611,48 @@ fn peer_addr(&self) -> SocketAddr
 fn session_id(&self) -> &[u8; 8]
 ```
 
+### 15.5 SigningKey — Persistent Identity
+
+`SigningKey` (in `smrp_core::crypto`) wraps an Ed25519 key pair with PKCS#8
+DER serialisation support.
+
+```rust
+// Generate a fresh Ed25519 key pair
+fn generate() -> Result<SigningKey, SmrpError>
+
+// Load from PKCS#8 DER bytes (e.g., bytes previously read from disk)
+fn from_pkcs8(bytes: &[u8]) -> Result<SigningKey, SmrpError>
+
+// Return the raw PKCS#8 DER bytes for persisting to disk
+fn to_pkcs8(&self) -> &[u8]
+
+// Return the 32-byte Ed25519 public key (fingerprint)
+fn public_key_bytes(&self) -> &[u8; 32]
+```
+
+**Recommended server pattern:**
+
+```rust
+const KEY_FILE: &str = "smrp_server.key";
+
+let sign_key = if Path::new(KEY_FILE).exists() {
+    let bytes = fs::read(KEY_FILE)?;
+    SigningKey::from_pkcs8(&bytes)?
+} else {
+    let key = SigningKey::generate()?;
+    fs::write(KEY_FILE, key.to_pkcs8())?;
+    key
+};
+// Display hex fingerprint so operators can pin the server identity
+println!("identity: {}", hex::encode(sign_key.public_key_bytes()));
+
+let listener = SmrpListener::bind_with_config_and_key(addr, cfg, sign_key).await?;
+```
+
+Clients performing key pinning should store the server's 32-byte public key
+on first connection (TOFU) and reject any future handshake that presents a
+different key.
+
 ---
 
-*End of Specification v0.3*
+*End of Specification v0.4*
