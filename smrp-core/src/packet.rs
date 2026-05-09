@@ -38,6 +38,14 @@ pub enum PacketType {
     Fin         = 0x09,
     /// Signals a protocol-level error to the peer.
     Error       = 0x0A,
+    /// Acknowledges a FIN packet; completes graceful teardown.
+    FinAck      = 0x0B,
+    /// Aborts a session immediately without waiting for acknowledgement.
+    Reset       = 0x0C,
+    /// RTT measurement request.
+    Ping        = 0x0D,
+    /// RTT measurement response.
+    Pong        = 0x0E,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -55,6 +63,10 @@ impl TryFrom<u8> for PacketType {
             0x08 => Ok(Self::KeyUpdateAck),
             0x09 => Ok(Self::Fin),
             0x0A => Ok(Self::Error),
+            0x0B => Ok(Self::FinAck),
+            0x0C => Ok(Self::Reset),
+            0x0D => Ok(Self::Ping),
+            0x0E => Ok(Self::Pong),
             _    => Err(SmrpError::MalformedHeader),
         }
     }
@@ -241,6 +253,10 @@ mod tests {
             (0x08, PacketType::KeyUpdateAck),
             (0x09, PacketType::Fin),
             (0x0A, PacketType::Error),
+            (0x0B, PacketType::FinAck),
+            (0x0C, PacketType::Reset),
+            (0x0D, PacketType::Ping),
+            (0x0E, PacketType::Pong),
         ];
         for (byte, expected) in cases {
             assert_eq!(PacketType::try_from(*byte).unwrap(), *expected);
@@ -254,7 +270,8 @@ mod tests {
 
     #[test]
     fn packet_type_out_of_range_is_invalid() {
-        assert_eq!(PacketType::try_from(0x0B), Err(SmrpError::MalformedHeader));
+        // 0x0F and above are undefined; 0x0E (Pong) is the highest valid code.
+        assert_eq!(PacketType::try_from(0x0F), Err(SmrpError::MalformedHeader));
         assert_eq!(PacketType::try_from(0xFF), Err(SmrpError::MalformedHeader));
     }
 

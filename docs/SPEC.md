@@ -1,8 +1,13 @@
 # SMRP Protocol Specification
 
-**Version:** 0.1  
+**Version:** 0.2  
 **Status:** Draft  
 **Authors:** Samir Gasimov
+
+> **Changelog v0.1→v0.2:** Corrected header layout to include `ack_number`
+> field; corrected packet-type wire values; corrected flag bit definitions;
+> corrected error-code table; added KeepaliveAck, KeyUpdate, KeyUpdateAck;
+> marked FIN_ACK, Reset, Ping as planned.
 
 ---
 
@@ -35,119 +40,142 @@ Non-goals: congestion control, retransmission, fragmentation, PKI.
 
 ## 3. Packet Format
 
-All integers are big-endian.
+All integers are **big-endian**.
 
 ```
 Offset  Size  Field
 ------  ----  -----
 0       4     Magic = 0x534D5250 ("SMRP")
 4       1     Version = 0x01
-5       1     Packet Type (see §4)
-6       1     Flags (see §5)
+5       1     Packet Type  (see §4)
+6       1     Flags        (see §5)
 7       1     Reserved (must be 0x00)
 8       8     Session ID
-16      8     Sequence Number (monotonically increasing per direction)
-24      8     Timestamp (microseconds since Unix epoch)
-32      4     Payload Length (bytes of payload following the header)
-36      1     Error Code (0x00 = no error; see §6)
-37      9     Reserved (must be 0x00)
-46      8     Reserved
+16      8     Sequence Number — monotonically increasing per sender direction
+24      8     ACK Number    — highest contiguous sequence number received from peer
+32      8     Timestamp     — microseconds since Unix epoch (sender clock)
+40      2     Payload Length — bytes of encrypted payload following the header
+42      12    Reserved / padding (must be 0x00)
 --- total header: 54 bytes ---
-54      N     Encrypted Payload (N = Payload Length)
+54      N     Encrypted Payload (N = Payload Length, 0 ≤ N ≤ 1 280)
 54+N    16    Poly1305 Authentication Tag
 ```
 
-Maximum payload: 1280 bytes.  
-Maximum on-wire packet: 54 + 1280 + 16 = **1350 bytes**.
+Maximum payload: **1 280 bytes**.  
+Maximum on-wire packet: 54 + 1 280 + 16 = **1 350 bytes**.
+
+### 3.1 Packet diagram
+
+```
+ 0       4       8       12      16      20      24
+ +-------+---+---+---+---+-------+-------+-------+
+ | Magic |Ver|Typ|Flg|Rsv|    Session ID (8)      |
+ +-------+---+---+---+---+-------+-------+-------+
+ |          Sequence Number (8)                   |
+ +-------+-------+-------+-------+-------+-------+
+ |           ACK Number (8)                       |
+ +-------+-------+-------+-------+-------+-------+
+ |           Timestamp µs (8)                     |
+ +---+---+-------+-------+-------+-------+-------+
+ |PLen(2)|          Reserved / Padding (12)       |
+ +-------+-------+-------+-------+-------+-------+
+ |  Encrypted Payload (0–1280 bytes)              |
+ |  + 16-byte Poly1305 authentication tag         |
+ +-------+-------+-------+-------+-------+-------+
+```
 
 ---
 
 ## 4. Packet Types
 
-| Value | Name       | Direction   | Description                              |
-|-------|------------|-------------|------------------------------------------|
-| 0x01  | HELLO      | C→S, S→C    | Handshake initiation / response          |
-| 0x02  | HELLO_ACK  | S→C         | Server handshake acknowledgement         |
-| 0x03  | DATA       | C↔S         | Application data (encrypted)             |
-| 0x04  | ACK        | C↔S         | Cumulative acknowledgement               |
-| 0x05  | FIN        | C↔S         | Graceful session teardown                |
-| 0x06  | FIN_ACK    | C↔S         | Acknowledge FIN                          |
-| 0x07  | KEEPALIVE  | C↔S         | Keepalive (no payload)                   |
-| 0x08  | ERROR      | C↔S         | Error notification                       |
-| 0x09  | RESET      | C↔S         | Immediate session reset                  |
-| 0x0A  | PING       | C↔S         | RTT measurement                          |
+| Wire | Name          | Direction | Description                                    |
+|------|---------------|-----------|------------------------------------------------|
+| 0x01 | HELLO         | C→S       | Handshake initiation — carries eph pub key     |
+| 0x02 | HELLO_ACK     | S→C       | Handshake response — carries server eph pub key |
+| 0x03 | DATA          | C↔S       | Application data (AEAD-encrypted)              |
+| 0x04 | ACK           | C↔S       | Cumulative acknowledgement (no payload)        |
+| 0x05 | KEEPALIVE     | C↔S       | Liveness probe when session is idle            |
+| 0x06 | KEEPALIVE_ACK | C↔S       | Response to KEEPALIVE                          |
+| 0x07 | KEY_UPDATE    | C↔S       | Initiate in-band rekeying (forward secrecy)    |
+| 0x08 | KEY_UPDATE_ACK| C↔S       | Acknowledge completion of KEY_UPDATE           |
+| 0x09 | FIN           | C↔S       | Graceful session teardown                      |
+| 0x0A | ERROR         | C↔S       | Signal a protocol error to the peer            |
+| 0x0B | FIN_ACK       | C↔S       | Acknowledge FIN *(planned)*                    |
+| 0x0C | RESET         | C↔S       | Immediate session abort *(planned)*            |
+| 0x0D | PING          | C↔S       | RTT measurement request *(planned)*            |
+| 0x0E | PONG          | C↔S       | RTT measurement response *(planned)*           |
 
 ---
 
 ## 5. Flags
 
-| Bit | Mask | Name        | Meaning                        |
-|-----|------|-------------|--------------------------------|
-| 0   | 0x01 | ENCRYPTED   | Payload is AEAD-encrypted      |
-| 1   | 0x02 | COMPRESSED  | Reserved, not implemented      |
-| 2   | 0x04 | FRAGMENTED  | Reserved, not implemented      |
-| 3–7 | —    | Reserved    | Must be 0                      |
+| Bit | Mask | Name                 | Meaning                                       |
+|-----|------|----------------------|-----------------------------------------------|
+| 0   | 0x01 | FIN                  | Set in FIN packets to signal teardown         |
+| 1   | 0x02 | KEY_UPDATE_REQUESTED | Sender wants to begin a KEY_UPDATE exchange   |
+| 2–7 | —    | Reserved             | Must be 0                                     |
 
 ---
 
 ## 6. Error Codes
 
-| Value | Name                 | Meaning                              |
-|-------|----------------------|--------------------------------------|
-| 0x00  | None                 | No error                             |
-| 0x01  | MalformedHeader      | Header parse failure                 |
-| 0x02  | InvalidVersion       | Unsupported protocol version         |
-| 0x03  | AuthenticationFailed | AEAD tag verification failed         |
-| 0x04  | ReplayDetected       | Sequence number already seen         |
-| 0x05  | SessionNotFound      | Unknown session ID                   |
-| 0x06  | HandshakeFailed      | Handshake could not complete         |
-| 0x07  | PayloadTooLarge      | Payload exceeds MAX_PAYLOAD          |
-| 0x08  | InvalidPacketType    | Unrecognised packet type field       |
-| 0x09  | Timeout              | Session timed out                    |
-| 0x0A  | InternalError        | Unexpected internal error            |
+Carried in ERROR packets (payload byte 0) and surfaced via `SmrpError`.
+
+| Wire | Rust variant          | Meaning                                       |
+|------|-----------------------|-----------------------------------------------|
+| 0x00 | NoError               | No error; sentinel in ACK packets             |
+| 0x01 | MalformedHeader       | Header parse failure or truncation            |
+| 0x02 | InvalidMagic          | Magic bytes ≠ 0x534D5250                      |
+| 0x03 | UnsupportedVersion    | Version byte not recognised                   |
+| 0x04 | AuthenticationFailure | AEAD tag verification failed                  |
+| 0x05 | UnknownSession        | Session ID not found in server state          |
+| 0x06 | ReplayDetected        | Sequence number outside or already in window  |
+| 0x07 | HandshakeTimeout      | HELLO_ACK not received within timeout         |
+| 0x08 | SessionLimitExceeded  | Server is at MAX_SESSIONS capacity            |
+| 0x09 | PayloadTooLarge       | Payload length exceeds MAX_PAYLOAD            |
+| 0x0A | InternalError         | Unexpected internal failure                   |
 
 ---
 
 ## 7. Handshake
 
-### 7.1 Overview
+### 7.1 State Machine
 
 ```
 Client                              Server
-  |                                    |
-  |--- HELLO (eph_pub, sign_pub, sig) -->|
-  |                                    |   verify sig
-  |                                    |   generate server eph keypair
-  |<-- HELLO (eph_pub, sign_pub, sig) ---|
-  |   verify sig                       |
-  |   derive session keys              |   derive session keys
-  |<-- HELLO_ACK (encrypted) ----------|
-  |                                    |
-  |=== DATA (encrypted) =============> |
+  │ [CLOSED]                          │ [LISTENING]
+  │                                   │
+  │── HELLO ─────────────────────────>│ verify Ed25519 sig
+  │   [HELLO_SENT]                    │ generate server eph keypair
+  │                                   │ derive session keys
+  │<─ HELLO_ACK ──────────────────────│ [ESTABLISHED]
+  │   verify Ed25519 sig              │
+  │   derive session keys             │
+  │   [ESTABLISHED]                   │
+  │                                   │
+  │══ DATA ══════════════════════════>│
+  │<═ DATA ═══════════════════════════│
 ```
 
-### 7.2 HELLO Payload (128 bytes)
+### 7.2 HELLO / HELLO_ACK Payload (128 bytes, unencrypted)
 
 ```
 Offset  Size  Field
 0       32    Ephemeral X25519 public key
 32      32    Ed25519 signing public key
-64      64    Ed25519 signature over (session_id[8] || eph_pub[32])
+64      64    Ed25519 signature over (session_id[8] ‖ eph_pub[32])
 ```
 
-Both sides sign and verify this payload. This provides mutual authentication:
-each side proves possession of the private signing key corresponding to the
-advertised signing public key.
+Both sides sign and verify. This provides mutual authentication without a PKI:
+each party proves possession of the signing private key.
 
 ### 7.3 Key Derivation
 
-After ECDH agreement on the shared secret:
-
 ```
-shared_secret = X25519(eph_priv, peer_eph_pub)   # 32 bytes
+shared_secret = X25519(eph_priv_local, eph_pub_peer)          # 32 bytes
 
-c2s_key = HKDF-SHA256(ikm=shared_secret, salt=session_id, info="smrp-c2s-key")[0..32]
-s2c_key = HKDF-SHA256(ikm=shared_secret, salt=session_id, info="smrp-s2c-key")[0..32]
+c2s_key = HKDF-SHA256(ikm=shared, salt=session_id, info="smrp-v1-c2s")[0..32]
+s2c_key = HKDF-SHA256(ikm=shared, salt=session_id, info="smrp-v1-s2c")[0..32]
 ```
 
 Client sends with `c2s_key`, receives with `s2c_key`.  
@@ -155,9 +183,15 @@ Server sends with `s2c_key`, receives with `c2s_key`.
 
 ### 7.4 Session ID
 
-The 8-byte session ID is generated by the client using a cryptographically
-secure random number generator and sent in the HELLO packet header. The server
-uses the same session ID for all subsequent packets of the session.
+8-byte cryptographically random value generated by the client, carried in every
+packet header. HELLO packets from an unknown session ID are treated as new
+connection requests.
+
+### 7.5 HELLO Timestamp Validation
+
+Server rejects HELLO packets whose `timestamp_us` header field is more than
+**30 seconds** in the past or future relative to the server's clock. This
+limits the replay window for HELLO packets to 60 seconds.
 
 ---
 
@@ -168,96 +202,141 @@ uses the same session ID for all subsequent packets of the session.
 Each DATA packet payload is encrypted with ChaCha20-Poly1305:
 
 ```
-nonce  = session_id[0..4] || seq.to_be_bytes()   # 12 bytes
-aad    = session_id[0..8] || seq.to_be_bytes()   # 16 bytes
-(ciphertext, tag) = ChaCha20Poly1305.seal(key, nonce, plaintext, aad)
+nonce = session_id[0..4] ‖ seq_be[8]            # 12 bytes
+aad   = session_id[0..8] ‖ seq_be[8]            # 16 bytes
+(ciphertext ‖ tag) = ChaCha20Poly1305.seal(send_key, nonce, plaintext, aad)
 ```
 
-The auth tag (16 bytes) is appended immediately after the ciphertext.
+The 16-byte Poly1305 tag is appended immediately after the ciphertext.
 
 ### 8.2 Sequence Numbers
 
-Sequence numbers are unsigned 64-bit integers, starting at 0, incrementing by 1
-per packet per direction. They are included in the header unencrypted and also
-mixed into both the nonce and AAD.
+Unsigned 64-bit, zero-based, incrementing by 1 per DATA packet per direction.
+Included in the header unencrypted and committed into both nonce and AAD so any
+tampering is detected.
+
+### 8.3 ACK
+
+After receiving a DATA packet the receiver sends an ACK with
+`ack_number = sequence_number` of the DATA just processed and no payload. The
+sender's `ack_number` field in DATA packets carries the cumulative ACK for the
+reverse direction.
 
 ---
 
 ## 9. Anti-Replay Window
 
-SMRP uses an RFC 6479 style sliding window to reject duplicate and replayed
-packets.
+RFC 6479 sliding window, 128-bit bitmask.
 
-- Window size: 128 packets (128-bit integer bitmask)
-- Packets arrive out of order within the window are accepted
-- Packets older than `highest_seq - 128` are unconditionally rejected
-- Two-phase design: `can_accept()` check before AEAD; `mark_seen()` only after
-  AEAD authentication succeeds — prevents a forged packet from permanently
-  blocking replay of the genuine packet at that sequence number
+- Window size: **128 packets**
+- Packets within the window but with a bit already set → `ReplayDetected`
+- Packets more than 127 below the highest seen → `ReplayDetected`
+- **Two-phase design**: `can_accept(seq)` check before AEAD open;
+  `mark_seen(seq)` only after successful AEAD — prevents window poisoning by
+  forged packets with a valid-looking sequence number.
 
 ---
 
 ## 10. Session Teardown
 
-A sender issues a FIN packet (no payload, sequence number incremented). The
-receiver acknowledges with FIN_ACK. Either side may send FIN at any time.
-After sending FIN and receiving FIN_ACK, the session state is released.
+### Active close (initiator)
+
+1. Initiator sends FIN (`seq=N`, FIN flag set)
+2. Peer replies with FIN_ACK (`ack_number=N`)
+3. Initiator may then release session state
+
+### Passive close (responder)
+
+On FIN receipt, peer sends FIN_ACK and transitions to CLOSED.
+
+Both sides must respond to FIN within `KEEPALIVE_INTERVAL` × 3 or the session
+is force-torn-down without FIN_ACK.
 
 ---
 
-## 11. Keepalive
+## 11. Keepalive and Session Eviction
 
-If no DATA or ACK packet is sent within `KEEPALIVE_INTERVAL` (15 seconds),
-the sender emits a KEEPALIVE packet (no payload). If no packet is received
-for 3 × `KEEPALIVE_INTERVAL` the session is considered dead and torn down.
+If no DATA, ACK, or any other packet is sent for `KEEPALIVE_INTERVAL` (15 s),
+the sender MUST emit a KEEPALIVE (no payload).
+
+The peer MUST reply with KEEPALIVE_ACK.
+
+If no packet is received for `3 × KEEPALIVE_INTERVAL` (45 s) the session is
+considered dead and all state is released without sending FIN.
 
 ---
 
-## 12. Constants Reference
+## 12. In-Band Key Update
+
+To achieve periodic forward secrecy without a full re-handshake:
+
+1. Either side sets the `KEY_UPDATE_REQUESTED` flag in any DATA or ACK packet.
+2. Peer responds with a KEY_UPDATE packet carrying a fresh ephemeral public key.
+3. Initiator replies with KEY_UPDATE_ACK carrying its fresh ephemeral public key.
+4. Both sides derive new `send_key` / `recv_key` via the same HKDF process,
+   using the new shared secret and a new salt derived from the current session
+   state. Old keys are discarded.
+
+*(Implementation: planned)*
+
+---
+
+## 13. Constants Reference
 
 | Constant              | Value       |
 |-----------------------|-------------|
 | SMRP_MAGIC            | 0x534D5250  |
 | SMRP_VERSION          | 0x01        |
 | HEADER_LEN            | 54 bytes    |
-| MAX_PAYLOAD           | 1280 bytes  |
+| MAX_PAYLOAD           | 1 280 bytes |
 | AUTH_TAG_LEN          | 16 bytes    |
-| MAX_PACKET            | 1350 bytes  |
+| MAX_PACKET            | 1 350 bytes |
 | SESSION_ID_LEN        | 8 bytes     |
 | NONCE_LEN             | 12 bytes    |
 | REPLAY_WINDOW_SIZE    | 128 packets |
 | KEEPALIVE_INTERVAL    | 15 seconds  |
+| SESSION_DEAD_TIMEOUT  | 45 seconds  |
+| HELLO_CLOCK_SKEW_SECS | 30 seconds  |
 | MAX_SESSIONS          | 100 000     |
 
 ---
 
-## 13. Security Considerations
+## 14. Security Considerations
 
 ### Threat Model
 
-- Active network attacker (can inject, replay, reorder, drop packets)
-- Passive attacker (can observe all traffic)
-- Compromised ephemeral keys (forward secrecy limits blast radius)
+- Active network attacker (inject, replay, reorder, drop packets)
+- Passive attacker (observe all traffic)
+- Compromised long-term signing keys (forward secrecy via ephemeral keys)
 
 ### Forward Secrecy
 
 Ephemeral X25519 keypairs are generated per-session and discarded immediately
-after key derivation. Past sessions cannot be decrypted even if long-term
-signing keys are later compromised.
+after key derivation. In-band key update (§12) extends this to sub-session
+granularity.
 
-### Replay
+### Replay Protection
 
-The 128-packet sliding window rejects replayed packets. Sequence numbers are
-authenticated via AEAD AAD, preventing sequence-number manipulation.
+Two-layer defence:
+1. HELLO timestamp validation (§7.5) — limits HELLO replay to ±30 s window
+2. DATA sequence-number window (§9) — rejects any replayed DATA packet
+
+### DoS Mitigations
+
+- HELLO rate limiting: max 10 HELLO packets per source IP per second; excess
+  silently dropped before any crypto is performed
+- Half-open session limit: sessions in HANDSHAKING state count against a
+  separate, lower limit (1 000) so a HELLO flood cannot exhaust the full
+  MAX_SESSIONS quota
+- MAX_SESSIONS hard cap: HELLO beyond the limit is rejected with an ERROR
+  packet (SessionLimitExceeded)
 
 ### Known Weaknesses
 
-- No certificate infrastructure — caller must distribute signing public keys
-  out of band or accept TOFU (trust on first use)
-- Timing side-channels in ring are assumed handled by the ring crate; no
-  additional mitigations are applied
-- No DoS rate-limiting — a flood of HELLO packets will exhaust session slots
+- No certificate infrastructure — signing keys distributed out-of-band or TOFU
+- No fragmentation — callers must split payloads over MAX_PAYLOAD themselves
+- No congestion control — unreliable transport by design
 
 ---
 
-*End of Specification*
+*End of Specification v0.2*
