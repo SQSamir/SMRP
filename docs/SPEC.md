@@ -1,9 +1,17 @@
 # SMRP Protocol Specification
 
-**Version:** 0.4  
+**Version:** 0.5  
 **Status:** Draft  
 **Authors:** Samir Gasimov
 
+> **Changelog v0.4→v0.5:** Ordered in-order delivery implemented (§8.5) —
+> out-of-order DATA packets are buffered and delivered to the application in
+> send order; AIMD congestion control implemented (§8.6) — slow-start + AIMD
+> congestion avoidance; `send()` backpressures when the congestion window is
+> full; updated §13.2 with two new config fields (`initial_cwnd`,
+> `recv_buf_limit`); updated §15.1 (SmrpConfig); removed "No congestion
+> control" from Known Weaknesses.
+>
 > **Changelog v0.3→v0.4:** Retransmission implemented (§8.4) — removed from
 > Known Weaknesses; RESET, PING, PONG marked as implemented; added persistent
 > Ed25519 signing key API (§15.5); updated §13.2 with four new retransmission
@@ -25,7 +33,7 @@ Design goals:
 - Auditable implementation — no custom crypto, rely on `ring`
 - Async-first implementation with Tokio
 
-Non-goals: congestion control, fragmentation, PKI.
+Non-goals: fragmentation, PKI, full TCP-like flow control.
 
 ---
 
@@ -305,13 +313,68 @@ it is ambiguous whether an ACK was triggered by the original or the retransmit.
 | `rto_min`        | 50 ms   | Floor for RTO and retransmit-task check interval |
 | `rto_max`        | 30 s    | Ceiling for exponential backoff                  |
 
-### 8.5 RESET
+### 8.5 Ordered Delivery
+
+Even though SMRP runs over UDP, the application always receives DATA in the
+order the sender originally sent them.
+
+**Implementation:**
+
+1. The receiver maintains a reorder buffer (`BTreeMap<seq, plaintext>`) of
+   capacity `recv_buf_limit` (default: 256).
+2. Every authenticated DATA packet is ACKed immediately so the sender can
+   advance its retransmit buffer and congestion window.
+3. The decrypted payload is inserted into the reorder buffer keyed by its
+   sequence number.
+4. The receiver then drains contiguous entries starting from `next_deliver_seq`
+   into an in-order delivery queue.
+5. `recv()` returns entries from the delivery queue before pulling new packets
+   from the network, guaranteeing in-order application delivery.
+6. Out-of-order packets that arrive more than `recv_buf_limit` ahead of the
+   current delivery head are silently dropped; the peer will retransmit them.
+
+### 8.6 AIMD Congestion Control
+
+SMRP uses a simplified TCP-style AIMD algorithm to limit the number of
+unacknowledged DATA packets in flight.
+
+**Congestion window (cwnd):**
+
+- Initial value: `initial_cwnd` (default: 4 packets)
+- During **slow-start** (`cwnd < ssthresh`): increment cwnd by 1 for each ACK
+  received.
+- During **congestion avoidance** (`cwnd ≥ ssthresh`): increment cwnd by 1 when
+  a full window of ACKs has been received (i.e., every `cwnd` ACKs add 1).
+- On **retransmit** (packet loss signal): `ssthresh = max(cwnd/2, 2)`,
+  `cwnd = 1` — re-enter slow-start.
+
+**Backpressure:**
+
+`send()` blocks asynchronously when `pending_acks ≥ cwnd`. It registers a
+`Notify` listener *before* checking the window size to avoid the lost-wake
+race: if an ACK arrives between the check and the await, the notification is
+captured and `send()` returns immediately on the next iteration.
+
+**API constraint:** Because `send()` and `recv()` both require `&mut self`,
+they cannot run concurrently on the same connection. ACKs are only processed
+inside `recv_inner`. Callers that need to send more than `initial_cwnd`
+messages without interleaved `recv()` calls will deadlock. In those cases
+use a task-based split where one task sends and another receives.
+
+**Congestion control config fields:**
+
+| Field            | Default | Meaning                                       |
+|------------------|---------|-----------------------------------------------|
+| `initial_cwnd`   | 4       | Starting congestion window (packets in flight)|
+| `recv_buf_limit` | 256     | Max out-of-order packets in reorder buffer    |
+
+### 8.7 RESET
 
 On receipt of a RESET packet the session is closed immediately. No FIN_ACK is
 exchanged. `recv()` returns `Ok(None)`. The sender of RESET does not wait for
 any acknowledgement.
 
-### 8.6 PING / PONG
+### 8.8 PING / PONG
 
 PING is a one-way RTT probe. The receiver replies with PONG, echoing the PING's
 `timestamp_us` into its own `timestamp_us` field and the PING's `sequence_number`
@@ -437,6 +500,8 @@ See §15.1 for the full API.
 | rto_initial             | 200 ms     | Initial retransmission timeout                 |
 | rto_min                 | 50 ms      | Minimum RTO (also retransmit-task interval)    |
 | rto_max                 | 30 s       | Maximum RTO (exponential backoff ceiling)      |
+| initial_cwnd            | 4 pkts     | Starting congestion window (see §8.6)          |
+| recv_buf_limit          | 256 pkts   | Max out-of-order packets in reorder buffer     |
 
 ---
 
@@ -480,7 +545,9 @@ Two-layer defence:
 - **No certificate infrastructure** — signing keys distributed out-of-band or
   TOFU; no revocation
 - **No fragmentation** — callers must split payloads over MAX_PAYLOAD themselves
-- **No congestion control** — fire-and-forget by design; can saturate links
+- **Basic congestion control only** — AIMD is implemented (§8.6) but there is
+  no ECN, pacing, or bandwidth estimation; the `&mut self` API means send and
+  recv cannot run concurrently on one connection (see §8.6 API constraint)
 - **KEY_UPDATE not implemented** — long sessions do not get automatic rekeying;
   packet types 0x07/0x08 are defined on the wire but not yet handled
 - **Nonce entropy** — the 12-byte nonce uses only 32 bits of session ID entropy;
@@ -511,6 +578,8 @@ pub struct SmrpConfig {
     pub rto_initial:              Duration,  // default: 200 ms
     pub rto_min:                  Duration,  // default: 50 ms
     pub rto_max:                  Duration,  // default: 30 s
+    pub initial_cwnd:             usize,     // default: 4
+    pub recv_buf_limit:           usize,     // default: 256
 }
 
 impl Default for SmrpConfig { ... }
@@ -655,4 +724,4 @@ different key.
 
 ---
 
-*End of Specification v0.4*
+*End of Specification v0.5*

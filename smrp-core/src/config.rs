@@ -60,6 +60,20 @@ pub struct SmrpConfig {
     /// Maximum retransmission timeout (ceiling for exponential backoff).
     /// Default: 30 s.
     pub rto_max: Duration,
+
+    // ---- Congestion control --------------------------------------------------
+
+    /// Initial congestion window — maximum DATA packets in flight before the
+    /// first ACK arrives. Uses slow-start from this value up to `ssthresh`,
+    /// then switches to AIMD congestion avoidance. Default: 4.
+    pub initial_cwnd: usize,
+
+    // ---- Receive reorder buffer ---------------------------------------------
+
+    /// Maximum out-of-order DATA packets held in the receive reorder buffer.
+    /// Packets that would exceed this limit are dropped (and retransmitted by
+    /// the peer). Default: 256.
+    pub recv_buf_limit: usize,
 }
 
 impl Default for SmrpConfig {
@@ -79,6 +93,8 @@ impl Default for SmrpConfig {
             rto_initial:              Duration::from_millis(200),
             rto_min:                  Duration::from_millis(50),
             rto_max:                  Duration::from_secs(30),
+            initial_cwnd:             4,
+            recv_buf_limit:           256,
         }
     }
 }

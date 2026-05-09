@@ -43,7 +43,7 @@ use crate::{
     constants::{SMRP_MAGIC, SMRP_VERSION, MAX_PAYLOAD},
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -51,7 +51,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::{net::UdpSocket, sync::mpsc, time};
+use tokio::{net::UdpSocket, sync::{mpsc, Notify}, time};
 use tracing::{debug, warn};
 
 // ---------------------------------------------------------------------------
@@ -131,8 +131,14 @@ impl RttEstimator {
 }
 
 struct RetransmitState {
-    pending: BTreeMap<u64, RetransmitEntry>,
-    rtt:     RttEstimator,
+    pending:  BTreeMap<u64, RetransmitEntry>,
+    rtt:      RttEstimator,
+    /// Congestion window: max unACKed packets in flight.
+    cwnd:     usize,
+    /// Slow-start threshold; above this, switch to AIMD congestion avoidance.
+    ssthresh: usize,
+    /// ACK counter for the congestion-avoidance phase (add 1/cwnd per ACK).
+    ca_acks:  usize,
 }
 
 type RetransmitBuf = Arc<tokio::sync::Mutex<RetransmitState>>;
@@ -155,7 +161,16 @@ pub struct SmrpConnection {
 
     recv_key:    crate::crypto::SessionKey,
     recv_replay: ReplayWindow,
+    /// Highest in-order sequence number delivered to the application.
     recv_seq:    u64,
+    /// Out-of-order received plaintext waiting for earlier sequence numbers.
+    recv_buf:    BTreeMap<u64, Vec<u8>>,
+    /// Next sequence number to deliver to the caller (1-based).
+    next_deliver_seq: u64,
+    /// Decrypted, consecutive packets ready for the caller to receive.
+    deliver_queue: VecDeque<Vec<u8>>,
+    /// Max entries in `recv_buf` before arriving out-of-order packets are dropped.
+    recv_buf_limit: usize,
 
     data_rx: mpsc::Receiver<Pkt>,
 
@@ -170,6 +185,8 @@ pub struct SmrpConnection {
     retransmit_buf: RetransmitBuf,
     /// Dropping this stops the retransmit task cleanly.
     _retransmit_stop: mpsc::Sender<()>,
+    /// Notified when the congestion window opens (ACK received or cwnd grew).
+    window_notify: Arc<Notify>,
 
     cfg:     Arc<SmrpConfig>,
     metrics: Arc<SmrpMetrics>,
@@ -264,12 +281,16 @@ impl SmrpConnection {
         let (keepalive_stop_tx, keepalive_stop_rx) = mpsc::channel::<()>(1);
         let (retransmit_stop_tx, retransmit_stop_rx) = mpsc::channel::<()>(1);
         let (dead_notify_tx, dead_rx)              = mpsc::channel::<()>(1);
-        let last_recv_us = Arc::new(AtomicU64::new(timestamp_us()));
-        let closed       = Arc::new(AtomicBool::new(false));
+        let last_recv_us     = Arc::new(AtomicU64::new(timestamp_us()));
+        let closed           = Arc::new(AtomicBool::new(false));
+        let window_notify    = Arc::new(Notify::new());
 
         let retransmit_buf: RetransmitBuf = Arc::new(tokio::sync::Mutex::new(RetransmitState {
-            pending: BTreeMap::new(),
-            rtt:     RttEstimator::new(cfg.rto_initial, cfg.rto_min, cfg.rto_max),
+            pending:  BTreeMap::new(),
+            rtt:      RttEstimator::new(cfg.rto_initial, cfg.rto_min, cfg.rto_max),
+            cwnd:     cfg.initial_cwnd,
+            ssthresh: 64,
+            ca_acks:  0,
         }));
 
         spawn_keepalive_task(
@@ -298,6 +319,7 @@ impl SmrpConnection {
             cfg.rto_min,
         );
 
+        let recv_buf_limit = cfg.recv_buf_limit;
         Ok(Self {
             socket,
             peer_addr:         session.peer_addr,
@@ -307,12 +329,17 @@ impl SmrpConnection {
             recv_key:          session.recv_key.take().ok_or(SmrpError::InternalError)?,
             recv_replay:       session.recv_replay,
             recv_seq:          session.recv_seq,
+            recv_buf:          BTreeMap::new(),
+            next_deliver_seq:  1,
+            deliver_queue:     VecDeque::new(),
+            recv_buf_limit,
             data_rx,
             _keepalive_stop:   keepalive_stop_tx,
             last_recv_us,
             dead_rx,
             retransmit_buf,
             _retransmit_stop:  retransmit_stop_tx,
+            window_notify,
             cfg,
             metrics,
             closed,
@@ -323,9 +350,11 @@ impl SmrpConnection {
 
     /// Encrypts `data` and sends it as a DATA packet.
     ///
-    /// The packet is kept in an internal retransmit buffer until its ACK
-    /// is received. If no ACK arrives within the RTO, it is retransmitted
-    /// up to `cfg.max_retransmits` times before the session is declared dead.
+    /// Blocks when the congestion window is full (AIMD slow-start /
+    /// congestion-avoidance) and resumes automatically as ACKs arrive.
+    /// The packet is kept in a retransmit buffer until `ACKed`; it is
+    /// retransmitted up to `cfg.max_retransmits` times before the session
+    /// is declared dead.
     ///
     /// # Errors
     /// Returns [`SmrpError::PayloadTooLarge`] if `data.len() > MAX_PAYLOAD`.
@@ -333,6 +362,21 @@ impl SmrpConnection {
         if data.len() > MAX_PAYLOAD {
             return Err(SmrpError::PayloadTooLarge);
         }
+
+        // Congestion-window backpressure.
+        // Register notified() *before* the capacity check to avoid a
+        // lost-wake race: if an ACK arrives between the check and the
+        // await, the notification is still captured.
+        let notify = Arc::clone(&self.window_notify);
+        loop {
+            let notified = notify.notified();
+            {
+                let state = self.retransmit_buf.lock().await;
+                if state.pending.len() < state.cwnd { break; }
+            }
+            notified.await;
+        }
+
         let seq   = self.send_seq;
         let nonce = packet_nonce(self.session_id.as_bytes(), seq);
         let mut aad = [0u8; 16];
@@ -393,6 +437,11 @@ impl SmrpConnection {
 
     async fn recv_inner(&mut self) -> Result<Option<Vec<u8>>, SmrpError> {
         loop {
+            // Fast path: deliver consecutive packets already in the reorder buffer.
+            if let Some(data) = self.deliver_queue.pop_front() {
+                return Ok(Some(data));
+            }
+
             tokio::select! {
                 pkt = self.data_rx.recv() => {
                     let Some((hdr, payload)) = pkt else {
@@ -423,12 +472,25 @@ impl SmrpConnection {
                                 })?;
 
                             self.recv_replay.mark_seen(seq);
-                            self.recv_seq = seq;
+                            // Always ACK immediately so the sender clears its retransmit buffer,
+                            // regardless of whether we can deliver yet (reorder buffering).
                             let _ = self.send_ack(seq).await;
 
-                            self.metrics.packets_received.fetch_add(1, Ordering::Relaxed);
-                            self.metrics.bytes_received.fetch_add(plaintext.len() as u64, Ordering::Relaxed);
-                            return Ok(Some(plaintext));
+                            // Buffer the packet; drop it if the reorder buffer is full.
+                            if self.recv_buf.len() < self.recv_buf_limit {
+                                self.recv_buf.insert(seq, plaintext);
+                            }
+
+                            // Drain all consecutive packets starting from next_deliver_seq
+                            // into the delivery queue.
+                            while let Some(data) = self.recv_buf.remove(&self.next_deliver_seq) {
+                                self.recv_seq = self.next_deliver_seq;
+                                self.next_deliver_seq += 1;
+                                self.metrics.packets_received.fetch_add(1, Ordering::Relaxed);
+                                self.metrics.bytes_received.fetch_add(data.len() as u64, Ordering::Relaxed);
+                                self.deliver_queue.push_back(data);
+                            }
+                            // Loop back to pop from deliver_queue (fast path at top of loop).
                         }
 
                         PacketType::Ack => {
@@ -438,8 +500,22 @@ impl SmrpConnection {
                             let mut buf = self.retransmit_buf.lock().await;
                             if let Some(entry) = buf.pending.remove(&ack_n) {
                                 if entry.retries == 0 {
+                                    #[allow(clippy::cast_possible_truncation)]
                                     buf.rtt.update(entry.sent_at.elapsed().as_micros() as u64);
                                 }
+                                // AIMD congestion window update.
+                                if buf.cwnd < buf.ssthresh {
+                                    buf.cwnd = buf.cwnd.saturating_add(1); // slow start
+                                } else {
+                                    // Congestion avoidance: +1 per full window of ACKs.
+                                    buf.ca_acks = buf.ca_acks.saturating_add(1);
+                                    if buf.ca_acks >= buf.cwnd {
+                                        buf.cwnd = buf.cwnd.saturating_add(1);
+                                        buf.ca_acks = 0;
+                                    }
+                                }
+                                drop(buf);
+                                self.window_notify.notify_one();
                             }
                         }
 
@@ -684,7 +760,13 @@ fn spawn_retransmit_task(
 
                     if expired.is_empty() { continue; }
 
-                    // Apply backoff once per check cycle.
+                    // Treat any retransmit as a congestion signal (RFC 5681 §3.1):
+                    // halve ssthresh and reset cwnd to 1.
+                    state.ssthresh = (state.cwnd / 2).max(2);
+                    state.cwnd     = 1;
+                    state.ca_acks  = 0;
+
+                    // Apply RTO backoff once per check cycle.
                     state.rtt.backoff();
 
                     // Collect what to re-send and update retry counters.
@@ -1248,5 +1330,59 @@ mod tests {
         drop(listener);
         // The same PKCS8 bytes produce the same public key.
         let _ = pub_bytes;
+    }
+
+    // --- Ordered delivery ---
+
+    #[tokio::test]
+    async fn ordered_delivery_burst() {
+        // Send initial_cwnd (4) messages in a burst without waiting for replies,
+        // then collect all replies and verify they arrive in send order.
+        // This exercises the deliver_queue drain path: when multiple echoes have
+        // arrived before the first recv() call, they are returned in seq order.
+        let (addr, listener) = echo_server().await;
+        spawn_echo(listener);
+        let mut conn = SmrpConnection::connect(&addr.to_string()).await.unwrap();
+
+        // 4 == SmrpConfig::default().initial_cwnd — all fit without blocking.
+        const N: u8 = 4;
+        for i in 0..N {
+            conn.send(&[i]).await.unwrap();
+        }
+        for i in 0..N {
+            let reply = conn.recv().await.unwrap().unwrap();
+            assert_eq!(reply.as_slice(), &[i], "wrong reply at position {i}");
+        }
+        conn.close().await.unwrap();
+    }
+
+    // --- Congestion window ---
+
+    #[tokio::test]
+    async fn congestion_window_limits_pending() {
+        // With cwnd=2 the retransmit buffer must hold at most 2 unACKed packets.
+        // ACKs are only processed inside recv_inner, so pending stays at cwnd
+        // until the first recv() call drains them.
+        let client_cfg = Arc::new(SmrpConfig { initial_cwnd: 2, ..SmrpConfig::default() });
+        let (addr, listener) = echo_server().await;
+        spawn_echo(listener);
+        let mut conn = SmrpConnection::connect_with_config(&addr.to_string(), client_cfg)
+            .await.unwrap();
+
+        // Send exactly cwnd packets — both fit without blocking.
+        conn.send(&[0]).await.unwrap();
+        conn.send(&[1]).await.unwrap();
+
+        // ACKs sit in data_rx until recv() is called, so pending must still be 2.
+        let pending = conn.retransmit_buf.lock().await.pending.len();
+        assert_eq!(pending, 2, "expected 2 in-flight with cwnd=2, got {pending}");
+
+        // Process echoes — recv() drains ACKs internally, opening the window.
+        let r0 = conn.recv().await.unwrap().unwrap();
+        let r1 = conn.recv().await.unwrap().unwrap();
+        assert_eq!(r0, &[0]);
+        assert_eq!(r1, &[1]);
+
+        conn.close().await.unwrap();
     }
 }
