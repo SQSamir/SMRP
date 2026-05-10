@@ -32,7 +32,7 @@
 
 use crate::{
     config::SmrpConfig,
-    crypto::{packet_nonce, SigningKey},
+    crypto::{ed25519_verify, hkdf_sha256, packet_nonce, EphemeralKeypair, SessionKey, SigningKey},
     error::SmrpError,
     handshake,
     metrics::SmrpMetrics,
@@ -156,10 +156,10 @@ pub struct SmrpConnection {
     peer_addr: SocketAddr,
     session_id: SessionId,
 
-    send_key:  crate::crypto::SessionKey,
+    send_key:  SessionKey,
     send_seq:  u64,
 
-    recv_key:    crate::crypto::SessionKey,
+    recv_key:    SessionKey,
     recv_replay: ReplayWindow,
     /// Highest in-order sequence number delivered to the application.
     recv_seq:    u64,
@@ -187,6 +187,21 @@ pub struct SmrpConnection {
     _retransmit_stop: mpsc::Sender<()>,
     /// Notified when the congestion window opens (ACK received or cwnd grew).
     window_notify: Arc<Notify>,
+
+    // --- Key update ---
+    /// Local signing key used to authenticate `KEY_UPDATE` payloads.
+    sign_key: Arc<SigningKey>,
+    /// Peer's Ed25519 public key pinned at handshake time.
+    peer_sign_pub: [u8; 32],
+    /// Monotonic counter incremented each time we initiate a key update.
+    rekey_counter: u64,
+    /// Highest `KEY_UPDATE` counter accepted from the peer (anti-replay).
+    peer_rekey_counter: u64,
+    /// Ephemeral keypair kept while we wait for `KEY_UPDATE_ACK`.
+    pending_rekey: Option<EphemeralKeypair>,
+    /// `true` for connections created via `connect()`, `false` for server side.
+    /// Determines which derived key is the send key vs the receive key.
+    is_client: bool,
 
     cfg:     Arc<SmrpConfig>,
     metrics: Arc<SmrpMetrics>,
@@ -235,6 +250,7 @@ impl SmrpConnection {
         );
         let sign_key = SigningKey::generate()?;
         let session  = handshake::client_handshake(&socket, addr, &sign_key).await?;
+        let sign_key = Arc::new(sign_key);
 
         let (data_tx, data_rx) = mpsc::channel(cfg.session_channel_capacity);
         let session_id = session.id;
@@ -253,7 +269,7 @@ impl SmrpConnection {
         });
 
         // Client connections use a private metrics instance (not externally visible).
-        Self::assemble(session, socket, data_rx, cfg, Arc::new(SmrpMetrics::new()), None)
+        Self::assemble(session, socket, data_rx, cfg, Arc::new(SmrpMetrics::new()), None, sign_key, true)
     }
 
     // --- Internal constructors ---
@@ -266,10 +282,12 @@ impl SmrpConnection {
         cfg:             Arc<SmrpConfig>,
         metrics:         Arc<SmrpMetrics>,
         dead_session_tx: mpsc::Sender<SessionId>,
+        sign_key:        Arc<SigningKey>,
     ) -> Result<Self, SmrpError> {
-        Self::assemble(session, socket, data_rx, cfg, metrics, Some(dead_session_tx))
+        Self::assemble(session, socket, data_rx, cfg, metrics, Some(dead_session_tx), sign_key, false)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn assemble(
         mut session:     Session,
         socket:          Arc<UdpSocket>,
@@ -277,6 +295,8 @@ impl SmrpConnection {
         cfg:             Arc<SmrpConfig>,
         metrics:         Arc<SmrpMetrics>,
         dead_session_tx: Option<mpsc::Sender<SessionId>>,
+        sign_key:        Arc<SigningKey>,
+        is_client:       bool,
     ) -> Result<Self, SmrpError> {
         let (keepalive_stop_tx, keepalive_stop_rx) = mpsc::channel::<()>(1);
         let (retransmit_stop_tx, retransmit_stop_rx) = mpsc::channel::<()>(1);
@@ -319,7 +339,8 @@ impl SmrpConnection {
             cfg.rto_min,
         );
 
-        let recv_buf_limit = cfg.recv_buf_limit;
+        let recv_buf_limit  = cfg.recv_buf_limit;
+        let peer_sign_pub   = session.peer_sign_pub.ok_or(SmrpError::InternalError)?;
         Ok(Self {
             socket,
             peer_addr:         session.peer_addr,
@@ -340,6 +361,12 @@ impl SmrpConnection {
             retransmit_buf,
             _retransmit_stop:  retransmit_stop_tx,
             window_notify,
+            sign_key,
+            peer_sign_pub,
+            rekey_counter:      0,
+            peer_rekey_counter: 0,
+            pending_rekey:      None,
+            is_client,
             cfg,
             metrics,
             closed,
@@ -544,6 +571,10 @@ impl SmrpConnection {
                             }
                         }
 
+                        PacketType::KeyUpdate => {
+                            self.handle_key_update(hdr.sequence_number, &payload).await;
+                        }
+
                         _ => {}
                     }
                 }
@@ -554,6 +585,50 @@ impl SmrpConnection {
                 }
             }
         }
+    }
+
+    /// Initiates an in-band key update (rekeying).
+    ///
+    /// Generates a fresh ephemeral X25519 keypair, sends `KEY_UPDATE` to the peer,
+    /// and **blocks** until the peer's `KEY_UPDATE_ACK` is received and verified.
+    /// Once this method returns, all subsequent [`send`](Self::send) calls use the
+    /// newly derived session keys.
+    ///
+    /// **Prerequisite:** All previously sent DATA packets must have been
+    /// acknowledged before calling this method. Any packets still in the retransmit
+    /// buffer when rekeying completes will be retransmitted with the old key and
+    /// rejected by the peer (which now holds the new key), causing the session to
+    /// be declared dead. Ensure the retransmit buffer is empty — typically by
+    /// calling [`recv`](Self::recv) until all expected replies are received.
+    ///
+    /// # Errors
+    /// Returns [`SmrpError::HandshakeTimeout`] if no `KEY_UPDATE_ACK` arrives
+    /// within `cfg.recv_timeout`.
+    /// Returns [`SmrpError::AuthenticationFailure`] if the peer's reply fails
+    /// Ed25519 or AEAD verification.
+    pub async fn request_key_update(&mut self) -> Result<(), SmrpError> {
+        self.rekey_counter += 1;
+        let counter = self.rekey_counter;
+        let eph = EphemeralKeypair::generate()?;
+        let payload = build_key_update_payload(&eph, &self.sign_key, self.session_id, counter);
+        let hdr = SmrpHeader {
+            magic: SMRP_MAGIC, version: SMRP_VERSION,
+            packet_type: PacketType::KeyUpdate,
+            flags: Flags::default(), reserved: 0,
+            session_id: self.session_id,
+            sequence_number: counter,
+            ack_number: self.recv_seq,
+            timestamp_us: timestamp_us(),
+            payload_len: payload.len() as u16,
+        };
+        transport::send_raw(&self.socket, self.peer_addr, &hdr, &payload).await?;
+        self.pending_rekey = Some(eph);
+
+        // Block until KEY_UPDATE_ACK arrives and new keys are installed.
+        let timeout = self.cfg.recv_timeout;
+        time::timeout(timeout, self.wait_key_update_ack(counter))
+            .await
+            .map_err(|_| SmrpError::HandshakeTimeout)?
     }
 
     /// Sends FIN, waits up to `cfg.fin_ack_timeout` for `FIN_ACK`, then releases.
@@ -639,6 +714,90 @@ impl SmrpConnection {
             let Some((hdr, _)) = self.data_rx.recv().await else { return; };
             if hdr.packet_type == PacketType::FinAck { return; }
         }
+    }
+
+    async fn wait_key_update_ack(&mut self, counter: u64) -> Result<(), SmrpError> {
+        loop {
+            let Some((hdr, payload)) = self.data_rx.recv().await else {
+                return Err(SmrpError::InternalError);
+            };
+            if hdr.packet_type != PacketType::KeyUpdateAck { continue; }
+            if hdr.sequence_number != counter { continue; }
+
+            let our_eph = self.pending_rekey.take().ok_or(SmrpError::InternalError)?;
+            let peer_eph_pub = parse_key_update_payload(
+                &payload, &self.peer_sign_pub, self.session_id, counter,
+            ).inspect_err(|_| {
+                self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+            })?;
+
+            let shared = our_eph.agree(&peer_eph_pub)?;
+            self.install_rekey_keys(&shared, counter)?;
+            debug!("session {:?}: KEY_UPDATE complete (initiator) counter={counter}", self.session_id);
+            return Ok(());
+        }
+    }
+
+    async fn handle_key_update(&mut self, counter: u64, payload: &[u8]) {
+        if counter <= self.peer_rekey_counter {
+            return; // replay / retransmit of already-processed rekey
+        }
+        let peer_eph_pub = match parse_key_update_payload(
+            payload, &self.peer_sign_pub, self.session_id, counter,
+        ) {
+            Ok(p)  => p,
+            Err(e) => {
+                self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                warn!("KEY_UPDATE from {:?} rejected: {e}", self.session_id);
+                return;
+            }
+        };
+        let our_eph = match EphemeralKeypair::generate() {
+            Ok(e)  => e,
+            Err(e) => { warn!("KEY_UPDATE eph gen failed: {e}"); return; }
+        };
+        let ack_payload = build_key_update_payload(
+            &our_eph, &self.sign_key, self.session_id, counter,
+        );
+        let ack_hdr = SmrpHeader {
+            magic: SMRP_MAGIC, version: SMRP_VERSION,
+            packet_type: PacketType::KeyUpdateAck,
+            flags: Flags::default(), reserved: 0,
+            session_id: self.session_id,
+            sequence_number: counter,
+            ack_number: self.recv_seq,
+            timestamp_us: timestamp_us(),
+            payload_len: ack_payload.len() as u16,
+        };
+        if let Err(e) = transport::send_raw(
+            &self.socket, self.peer_addr, &ack_hdr, &ack_payload,
+        ).await {
+            warn!("KEY_UPDATE_ACK send failed: {e}");
+            return;
+        }
+        match our_eph.agree(&peer_eph_pub) {
+            Ok(shared) => match self.install_rekey_keys(&shared, counter) {
+                Ok(()) => {
+                    self.peer_rekey_counter = counter;
+                    debug!("session {:?}: KEY_UPDATE complete (responder) counter={counter}",
+                           self.session_id);
+                }
+                Err(e) => { warn!("KEY_UPDATE key install failed: {e}"); }
+            },
+            Err(e) => { warn!("KEY_UPDATE X25519 agree failed: {e}"); }
+        }
+    }
+
+    fn install_rekey_keys(&mut self, shared: &[u8; 32], counter: u64) -> Result<(), SmrpError> {
+        let (c2s, s2c) = derive_rekey_keys(shared, self.session_id, counter)?;
+        if self.is_client {
+            self.send_key = SessionKey::from_raw(&c2s)?;
+            self.recv_key = SessionKey::from_raw(&s2c)?;
+        } else {
+            self.send_key = SessionKey::from_raw(&s2c)?;
+            self.recv_key = SessionKey::from_raw(&c2s)?;
+        }
+        Ok(())
     }
 
     // --- Accessors ---
@@ -798,6 +957,82 @@ fn spawn_retransmit_task(
             }
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// KEY_UPDATE helpers
+// ---------------------------------------------------------------------------
+
+const KEY_UPDATE_PAYLOAD_LEN: usize = 32 + 32 + 64;
+
+/// Builds a 128-byte `KEY_UPDATE` / `KEY_UPDATE_ACK` payload.
+/// Layout: `eph_pub[32] || sign_pub[32] || sig[64]`
+/// Signature covers: `session_id[8] || eph_pub[32] || counter_be[8]`.
+fn build_key_update_payload(
+    eph:        &EphemeralKeypair,
+    sign_key:   &SigningKey,
+    session_id: SessionId,
+    counter:    u64,
+) -> Vec<u8> {
+    let eph_pub  = eph.public_key_bytes();
+    let sign_pub = sign_key.public_key_bytes();
+    let mut msg  = Vec::with_capacity(8 + 32 + 8);
+    msg.extend_from_slice(session_id.as_bytes());
+    msg.extend_from_slice(eph_pub);
+    msg.extend_from_slice(&counter.to_be_bytes());
+    let sig = sign_key.sign(&msg);
+    let mut payload = Vec::with_capacity(KEY_UPDATE_PAYLOAD_LEN);
+    payload.extend_from_slice(eph_pub);
+    payload.extend_from_slice(sign_pub);
+    payload.extend_from_slice(&sig);
+    payload
+}
+
+/// Parses and verifies a `KEY_UPDATE` / `KEY_UPDATE_ACK` payload.
+/// Returns the peer's new ephemeral X25519 public key on success.
+fn parse_key_update_payload(
+    payload:       &[u8],
+    peer_sign_pub: &[u8; 32],
+    session_id:    SessionId,
+    counter:       u64,
+) -> Result<[u8; 32], SmrpError> {
+    if payload.len() < KEY_UPDATE_PAYLOAD_LEN {
+        return Err(SmrpError::MalformedHeader);
+    }
+    let mut eph_pub  = [0u8; 32];
+    let mut sign_pub = [0u8; 32];
+    let mut sig      = [0u8; 64];
+    eph_pub .copy_from_slice(&payload[ 0..32]);
+    sign_pub.copy_from_slice(&payload[32..64]);
+    sig     .copy_from_slice(&payload[64..128]);
+
+    // Reject if the identity key changed — we only accept rekeys from the pinned peer.
+    if &sign_pub != peer_sign_pub {
+        return Err(SmrpError::AuthenticationFailure);
+    }
+
+    let mut msg = Vec::with_capacity(8 + 32 + 8);
+    msg.extend_from_slice(session_id.as_bytes());
+    msg.extend_from_slice(&eph_pub);
+    msg.extend_from_slice(&counter.to_be_bytes());
+    ed25519_verify(peer_sign_pub, &msg, &sig)?;
+
+    Ok(eph_pub)
+}
+
+/// Derives new send/receive key material from a rekey shared secret.
+/// Returns `(c2s_raw, s2c_raw)`.
+fn derive_rekey_keys(
+    shared:     &[u8; 32],
+    session_id: SessionId,
+    counter:    u64,
+) -> Result<([u8; 32], [u8; 32]), SmrpError> {
+    let mut salt = [0u8; 16];
+    salt[0..8].copy_from_slice(session_id.as_bytes());
+    salt[8..16].copy_from_slice(&counter.to_be_bytes());
+    let c2s = hkdf_sha256(shared, &salt, b"smrp-v1-rekey-c2s")?;
+    let s2c = hkdf_sha256(shared, &salt, b"smrp-v1-rekey-s2c")?;
+    Ok((c2s, s2c))
 }
 
 // ---------------------------------------------------------------------------
@@ -973,7 +1208,7 @@ fn spawn_hello_handler(
         let conn_sid = session.id;
 
         let conn = match SmrpConnection::from_server_session(
-            session, socket, data_rx, cfg, Arc::clone(&metrics), dead_sess_tx,
+            session, socket, data_rx, cfg, Arc::clone(&metrics), dead_sess_tx, Arc::clone(&sign_key),
         ) {
             Ok(c)  => c,
             Err(e) => { warn!("connection assembly failed: {e}"); return; }
@@ -1058,7 +1293,8 @@ async fn listener_dispatch(
 
                     PacketType::Data | PacketType::Fin | PacketType::FinAck
                     | PacketType::Ack | PacketType::Keepalive | PacketType::KeepaliveAck
-                    | PacketType::Reset | PacketType::Ping | PacketType::Pong => {
+                    | PacketType::Reset | PacketType::Ping | PacketType::Pong
+                    | PacketType::KeyUpdate | PacketType::KeyUpdateAck => {
                         let mut map = sessions.lock().await;
                         let sid    = hdr.session_id;
                         let remove = if let Some(entry) = map.get(&sid) {
@@ -1353,6 +1589,31 @@ mod tests {
             let reply = conn.recv().await.unwrap().unwrap();
             assert_eq!(reply.as_slice(), &[i], "wrong reply at position {i}");
         }
+        conn.close().await.unwrap();
+    }
+
+    // --- KEY_UPDATE ---
+
+    #[tokio::test]
+    async fn key_update_rotates_session_keys() {
+        // Verify that data sent before and after a key update is correctly
+        // encrypted and decrypted: the rekey must be transparent to the application.
+        let (addr, listener) = echo_server().await;
+        spawn_echo(listener);
+        let mut conn = SmrpConnection::connect(&addr.to_string()).await.unwrap();
+
+        // Send and receive a message with the initial session keys.
+        conn.send(b"pre-rekey").await.unwrap();
+        assert_eq!(conn.recv().await.unwrap().unwrap(), b"pre-rekey");
+
+        // Initiate a key update; blocks until KEY_UPDATE_ACK is received and
+        // the new keys are installed on both sides.
+        conn.request_key_update().await.unwrap();
+
+        // Send and receive with the rotated keys.
+        conn.send(b"post-rekey").await.unwrap();
+        assert_eq!(conn.recv().await.unwrap().unwrap(), b"post-rekey");
+
         conn.close().await.unwrap();
     }
 

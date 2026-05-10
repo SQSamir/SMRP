@@ -23,6 +23,7 @@ a minimal, auditable implementation in safe Rust.
 - **Reliable delivery** — per-packet retransmit buffer; Jacobson/Karels RTT estimator; exponential backoff; Karn's algorithm
 - **Ordered delivery** — out-of-order DATA packets are buffered and delivered to the application in send order
 - **AIMD congestion control** — slow-start + AIMD congestion avoidance; `send()` backpressures when the congestion window is full
+- **In-band key update** — `request_key_update()` rotates session keys mid-stream via X25519 + HKDF without a full re-handshake; Ed25519 identity pinning prevents impersonation
 - **RESET / PING / PONG** — immediate abort, RTT probing (echoes timestamp_us for clock-free RTT measurement)
 - **Persistent signing identity** — Ed25519 PKCS#8 `to_pkcs8` / `from_pkcs8`; `bind_with_config_and_key` for stable server fingerprint
 - **Graceful teardown** — FIN / FIN_ACK exchange; configurable `fin_ack_timeout`
@@ -91,8 +92,8 @@ Offset  Size  Field
 | 0x04 | ACK            | Cumulative acknowledgement                 | Implemented |
 | 0x05 | KEEPALIVE      | Liveness probe                             | Implemented |
 | 0x06 | KEEPALIVE_ACK  | Keepalive response                         | Implemented |
-| 0x07 | KEY_UPDATE     | In-band rekeying initiation                | Planned     |
-| 0x08 | KEY_UPDATE_ACK | Rekeying acknowledgement                   | Planned     |
+| 0x07 | KEY_UPDATE     | In-band rekeying initiation                | Implemented |
+| 0x08 | KEY_UPDATE_ACK | Rekeying acknowledgement                   | Implemented |
 | 0x09 | FIN            | Graceful teardown                          | Implemented |
 | 0x0A | ERROR          | Protocol error notification                | Implemented |
 | 0x0B | FIN_ACK        | Acknowledge FIN                            | Implemented |
@@ -250,7 +251,7 @@ smrp/
 ├── smrp-server/        # Binary: echo server with persistent signing key
 ├── smrp-cli/           # Binary: command-line client
 ├── docs/
-│   └── SPEC.md         # Full protocol specification (v0.5)
+│   └── SPEC.md         # Full protocol specification (v0.6)
 └── LICENSE
 ```
 
@@ -262,7 +263,7 @@ smrp/
 cargo test --workspace
 ```
 
-**54 tests** across all modules:
+**55 tests** across all modules:
 
 | Module      | Tests | Coverage                                                          |
 |-------------|-------|-------------------------------------------------------------------|
@@ -271,10 +272,10 @@ cargo test --workspace
 | `packet`    | 13    | Parse/serialize, all 14 packet types, flag bits                   |
 | `session`   | 3     | SessionId equality, state copy                                    |
 | `replay`    | 11    | In-order, replay, out-of-order, two-phase, window slide           |
-| `conn`      | 16    | Round-trip, concurrency, max payload, timeouts, FIN/FIN_ACK,      |
+| `conn`      | 17    | Round-trip, concurrency, max payload, timeouts, FIN/FIN_ACK,      |
 |             |       | metrics, custom config, shutdown, no-accept-after-shutdown,       |
 |             |       | retransmit-buffer drain, PKCS8 roundtrip, persistent key bind,    |
-|             |       | ordered delivery, congestion window backpressure                  |
+|             |       | ordered delivery, congestion window backpressure, key rotation     |
 | doc-tests   | 2     | API examples compile and run                                      |
 
 ### Running Fuzz Targets
@@ -318,13 +319,14 @@ cargo +nightly fuzz run fuzz_replay_window
 | Reliable delivery         | Per-packet retransmit buffer; Jacobson/Karels RTO      |
 | Ordered delivery          | Reorder buffer delivers application data in send order |
 | Congestion control        | AIMD slow-start + congestion avoidance; cwnd backpressure |
+| Sub-session forward secrecy | `request_key_update()` rotates keys without re-handshake |
 
 ### Known Limitations
 
 - No certificate infrastructure — signing keys distributed out-of-band or TOFU; no revocation
 - Basic congestion control only — no ECN, pacing, or bandwidth estimation; sequential `&mut self` API means send and recv cannot run concurrently on one connection
 - No fragmentation — payloads over 1 280 bytes must be split by the caller
-- In-band key update (KEY_UPDATE / KEY_UPDATE_ACK) defined in spec, not yet implemented
+- Key update sequencing constraint — retransmit buffer must be empty before `request_key_update()`; in-flight packets at rekey time cause session death
 - Nonce uses only 32 bits of session ID entropy; full 64-bit session IDs are preferred at extreme session counts
 - **Not audited** — cryptographic usage has not been reviewed by a third party
 

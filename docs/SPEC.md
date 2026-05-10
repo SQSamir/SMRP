@@ -1,9 +1,14 @@
 # SMRP Protocol Specification
 
-**Version:** 0.5  
+**Version:** 0.6  
 **Status:** Draft  
 **Authors:** Samir Gasimov
 
+> **Changelog v0.5→v0.6:** In-band key update implemented (§12) — `KEY_UPDATE`
+> and `KEY_UPDATE_ACK` are now fully handled; `request_key_update()` API added;
+> Ed25519 identity pinning enforced on rekey; `smrp-v1-rekey-c2s` /
+> `smrp-v1-rekey-s2c` HKDF info strings defined; known weaknesses updated.
+>
 > **Changelog v0.4→v0.5:** Ordered in-order delivery implemented (§8.5) —
 > out-of-order DATA packets are buffered and delivered to the application in
 > send order; AIMD congestion control implemented (§8.6) — slow-start + AIMD
@@ -105,8 +110,8 @@ Maximum on-wire packet: 54 + 1 280 + 16 = **1 350 bytes**.
 | 0x04 | ACK            | C↔S       | Cumulative acknowledgement (no payload)        | Implemented |
 | 0x05 | KEEPALIVE      | C↔S       | Liveness probe when session is idle            | Implemented |
 | 0x06 | KEEPALIVE_ACK  | C↔S       | Response to KEEPALIVE                          | Implemented |
-| 0x07 | KEY_UPDATE     | C↔S       | Initiate in-band rekeying (forward secrecy)    | Planned     |
-| 0x08 | KEY_UPDATE_ACK | C↔S       | Acknowledge completion of KEY_UPDATE           | Planned     |
+| 0x07 | KEY_UPDATE     | C↔S       | Initiate in-band rekeying (forward secrecy)    | Implemented |
+| 0x08 | KEY_UPDATE_ACK | C↔S       | Acknowledge completion of KEY_UPDATE           | Implemented |
 | 0x09 | FIN            | C↔S       | Graceful session teardown                      | Implemented |
 | 0x0A | ERROR          | C↔S       | Signal a protocol error to the peer            | Implemented |
 | 0x0B | FIN_ACK        | C↔S       | Acknowledge FIN; completes graceful teardown   | Implemented |
@@ -448,16 +453,76 @@ No FIN is sent on eviction — the peer is assumed unreachable.
 
 ## 12. In-Band Key Update
 
-*(Status: Planned — packet types 0x07/0x08 are defined on the wire but not yet handled.)*
+*(Status: Implemented — packet types 0x07/0x08 fully handled; API: `request_key_update()`)*
 
-To achieve periodic forward secrecy without a full re-handshake:
+Either party may initiate a key update at any time to rotate session keys without
+a full re-handshake, providing sub-session forward secrecy.
 
-1. Either side sets the `KEY_UPDATE_REQUESTED` flag in any DATA or ACK packet.
-2. Peer responds with a KEY_UPDATE packet carrying a fresh ephemeral public key.
-3. Initiator replies with KEY_UPDATE_ACK carrying its fresh ephemeral public key.
-4. Both sides derive new `send_key` / `recv_key` via the same HKDF process,
-   using the new shared secret and a new salt derived from the current session
-   state. Old keys are discarded.
+### 12.1 Protocol Flow
+
+```
+Initiator                          Responder
+  │                                    │
+  │── KEY_UPDATE (eph_pub_i, sig) ────>│  verify sig
+  │   seq = rekey_counter              │  generate eph keypair r
+  │                                    │  send KEY_UPDATE_ACK
+  │<── KEY_UPDATE_ACK (eph_pub_r, sig) │  derive and install new keys
+  │    seq = rekey_counter             │
+  │  verify sig                        │
+  │  derive and install new keys       │
+```
+
+### 12.2 Payload Layout (128 bytes, unencrypted)
+
+```
+Offset  Size  Field
+0       32    New ephemeral X25519 public key
+32      32    Ed25519 signing public key (pinned from handshake)
+64      64    Ed25519 signature over (session_id[8] ‖ new_eph_pub[32] ‖ rekey_counter_be[8])
+```
+
+The signature binds the new ephemeral key to the session ID and a monotonically
+increasing `rekey_counter`, preventing replay of old `KEY_UPDATE` messages.
+
+### 12.3 Key Derivation
+
+```
+shared_secret = X25519(local_eph_priv, peer_eph_pub)
+
+salt = session_id[8] ‖ rekey_counter_be[8]
+
+c2s = HKDF-SHA256(shared_secret, salt, "smrp-v1-rekey-c2s")
+s2c = HKDF-SHA256(shared_secret, salt, "smrp-v1-rekey-s2c")
+```
+
+Client: `send_key = c2s`, `recv_key = s2c`  
+Server: `send_key = s2c`, `recv_key = c2s`
+
+The client/server asymmetry established during the initial handshake is preserved
+across all subsequent rekeys.
+
+### 12.4 Identity Pinning
+
+The Ed25519 signing public key in the payload must match the key pinned during
+the handshake. A `KEY_UPDATE` payload carrying a different signing key is
+rejected as an `AuthenticationFailure`, preventing identity substitution attacks.
+
+### 12.5 API and Sequencing Constraint
+
+```rust
+// Blocks until KEY_UPDATE_ACK is received and new keys are installed.
+async fn request_key_update(&mut self) -> Result<(), SmrpError>
+```
+
+`request_key_update()` blocks internally until the full exchange completes.
+All `send()` calls after it return will use the rotated keys.
+
+**Prerequisite:** The retransmit buffer must be empty before calling
+`request_key_update()`. Any packets still in the buffer will be retransmitted
+after the key switch using the old ciphertext, which the peer (now holding new
+keys) will reject as an authentication failure, causing the session to be
+declared dead. Ensure all sent data has been acknowledged — typically by calling
+`recv()` until all expected replies are received.
 
 ---
 
@@ -548,8 +613,9 @@ Two-layer defence:
 - **Basic congestion control only** — AIMD is implemented (§8.6) but there is
   no ECN, pacing, or bandwidth estimation; the `&mut self` API means send and
   recv cannot run concurrently on one connection (see §8.6 API constraint)
-- **KEY_UPDATE not implemented** — long sessions do not get automatic rekeying;
-  packet types 0x07/0x08 are defined on the wire but not yet handled
+- **KEY_UPDATE sequential constraint** — `request_key_update()` requires the
+  retransmit buffer to be empty; in-flight packets at rekey time will cause
+  session death. Callers must drain pending ACKs before initiating a rekey.
 - **Nonce entropy** — the 12-byte nonce uses only 32 bits of session ID entropy;
   within a session nonce uniqueness is guaranteed by the 64-bit sequence number,
   but cross-session collision probability should be considered at very high
@@ -724,4 +790,14 @@ different key.
 
 ---
 
-*End of Specification v0.5*
+### 15.6 SmrpConnection — Key Update API
+
+```rust
+// Initiate in-band key rotation (blocks until KEY_UPDATE_ACK received).
+// All send() calls after this return use the new session keys.
+async fn request_key_update(&mut self) -> Result<(), SmrpError>
+```
+
+See §12 for the full protocol description and sequencing requirements.
+
+*End of Specification v0.6*
