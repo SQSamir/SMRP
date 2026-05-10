@@ -1,8 +1,4 @@
-use smrp_core::{
-    config::SmrpConfig,
-    conn::SmrpListener,
-    crypto::SigningKey,
-};
+use smrp_core::{config::SmrpConfig, conn::SmrpListener, crypto::SigningKey};
 use std::{fs, path::Path, sync::Arc};
 use tracing::info;
 

@@ -67,8 +67,8 @@ fn parse_hello_payload(
 }
 
 struct DerivedKeys {
-    c2s:      [u8; 32],
-    s2c:      [u8; 32],
+    c2s: [u8; 32],
+    s2c: [u8; 32],
     data_c2s: [u8; 4],
     data_s2c: [u8; 4],
     ctrl_c2s: [u8; 4],
@@ -144,8 +144,7 @@ pub async fn client_handshake(
         return Err(SmrpError::MalformedHeader);
     }
 
-    let (server_eph_pub, server_sign_pub) =
-        parse_hello_payload(&ack_payload, session_id)?;
+    let (server_eph_pub, server_sign_pub) = parse_hello_payload(&ack_payload, session_id)?;
 
     let shared = eph.agree(&server_eph_pub)?;
     let dk = derive_keys_and_prefixes(&shared, session_id)?;
@@ -187,8 +186,7 @@ pub async fn server_handshake(
     hello_payload: &[u8],
     server_sign_key: &SigningKey,
 ) -> Result<Session, SmrpError> {
-    let (client_eph_pub, client_sign_pub) =
-        parse_hello_payload(hello_payload, session_id)?;
+    let (client_eph_pub, client_sign_pub) = parse_hello_payload(hello_payload, session_id)?;
 
     let server_eph = EphemeralKeypair::generate()?;
     let ack_payload = build_hello_payload(&server_eph, server_sign_key, session_id);

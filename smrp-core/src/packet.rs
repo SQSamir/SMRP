@@ -19,33 +19,33 @@ pub fn timestamp_us() -> u64 {
 #[repr(u8)]
 pub enum PacketType {
     /// Initiates a new session and carries the sender's ephemeral public key.
-    Hello       = 0x01,
+    Hello = 0x01,
     /// Acknowledges a `Hello` and completes the key-exchange step.
-    HelloAck    = 0x02,
+    HelloAck = 0x02,
     /// Carries application-layer ciphertext after the handshake.
-    Data        = 0x03,
+    Data = 0x03,
     /// Acknowledges receipt of one or more `Data` packets.
-    Ack         = 0x04,
+    Ack = 0x04,
     /// Probes session liveness when no data has been exchanged recently.
-    Keepalive   = 0x05,
+    Keepalive = 0x05,
     /// Response to a `Keepalive` probe.
-    KeepaliveAck= 0x06,
+    KeepaliveAck = 0x06,
     /// Initiates rekeying for forward secrecy.
-    KeyUpdate   = 0x07,
+    KeyUpdate = 0x07,
     /// Acknowledges completion of a key-update exchange.
-    KeyUpdateAck= 0x08,
+    KeyUpdateAck = 0x08,
     /// Initiates graceful session teardown.
-    Fin         = 0x09,
+    Fin = 0x09,
     /// Signals a protocol-level error to the peer.
-    Error       = 0x0A,
+    Error = 0x0A,
     /// Acknowledges a FIN packet; completes graceful teardown.
-    FinAck      = 0x0B,
+    FinAck = 0x0B,
     /// Aborts a session immediately without waiting for acknowledgement.
-    Reset       = 0x0C,
+    Reset = 0x0C,
     /// RTT measurement request.
-    Ping        = 0x0D,
+    Ping = 0x0D,
     /// RTT measurement response.
-    Pong        = 0x0E,
+    Pong = 0x0E,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -67,7 +67,7 @@ impl TryFrom<u8> for PacketType {
             0x0C => Ok(Self::Reset),
             0x0D => Ok(Self::Ping),
             0x0E => Ok(Self::Pong),
-            _    => Err(SmrpError::MalformedHeader),
+            _ => Err(SmrpError::MalformedHeader),
         }
     }
 }
@@ -78,7 +78,7 @@ pub struct Flags(pub u8);
 
 impl Flags {
     /// Bit 0 — session teardown flag; set in `Fin` packets.
-    pub const FIN: u8                 = 0b0000_0001;
+    pub const FIN: u8 = 0b0000_0001;
     /// Bit 1 — indicates the sender wants to begin a key-update exchange.
     pub const KEY_UPDATE_REQUESTED: u8 = 0b0000_0010;
 
@@ -171,8 +171,8 @@ pub fn parse(src: &[u8]) -> Result<SmrpHeader, SmrpError> {
     }
 
     let packet_type = PacketType::try_from(cursor.get_u8())?;
-    let flags       = Flags(cursor.get_u8());
-    let reserved    = cursor.get_u8();
+    let flags = Flags(cursor.get_u8());
+    let reserved = cursor.get_u8();
 
     let mut sid_bytes = [0u8; 8];
     sid_bytes.copy_from_slice(&cursor[..8]);
@@ -180,9 +180,9 @@ pub fn parse(src: &[u8]) -> Result<SmrpHeader, SmrpError> {
     let session_id = SessionId::from_bytes(sid_bytes);
 
     let sequence_number = cursor.get_u64();
-    let ack_number      = cursor.get_u64();
-    let timestamp_us    = cursor.get_u64();
-    let payload_len     = cursor.get_u16();
+    let ack_number = cursor.get_u64();
+    let timestamp_us = cursor.get_u64();
+    let payload_len = cursor.get_u16();
 
     Ok(SmrpHeader {
         magic,
@@ -226,16 +226,16 @@ mod tests {
     fn valid_buf() -> [u8; 54] {
         let mut b = [0u8; 54];
         b[0..4].copy_from_slice(&0x534D_5250u32.to_be_bytes()); // magic
-        b[4] = 0x02;                                             // version
-        b[5] = 0x03;                                             // Data
-        b[6] = 0x01;                                             // FIN flag
-        b[7] = 0x00;                                             // reserved
-        b[8..16].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);   // session_id
-        b[16..24].copy_from_slice(&42u64.to_be_bytes());         // seq
-        b[24..32].copy_from_slice(&41u64.to_be_bytes());         // ack
-        b[32..40].copy_from_slice(&1_000_000u64.to_be_bytes());  // timestamp_us
-        b[40..42].copy_from_slice(&512u16.to_be_bytes());        // payload_len
-        // bytes 42-53: pad zeros
+        b[4] = 0x02; // version
+        b[5] = 0x03; // Data
+        b[6] = 0x01; // FIN flag
+        b[7] = 0x00; // reserved
+        b[8..16].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]); // session_id
+        b[16..24].copy_from_slice(&42u64.to_be_bytes()); // seq
+        b[24..32].copy_from_slice(&41u64.to_be_bytes()); // ack
+        b[32..40].copy_from_slice(&1_000_000u64.to_be_bytes()); // timestamp_us
+        b[40..42].copy_from_slice(&512u16.to_be_bytes()); // payload_len
+                                                          // bytes 42-53: pad zeros
         b
     }
 

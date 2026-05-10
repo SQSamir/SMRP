@@ -43,7 +43,10 @@ fn x25519_different_pairs_produce_different_secrets() {
 
     let shared_ab = a.agree(&b_pub).unwrap();
     let shared_cb = c.agree(&a_pub).unwrap(); // c uses a's pub, not b's
-    assert_ne!(shared_ab, shared_cb, "different key pairs must produce different secrets");
+    assert_ne!(
+        shared_ab, shared_cb,
+        "different key pairs must produce different secrets"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -55,7 +58,7 @@ fn x25519_different_pairs_produce_different_secrets() {
 /// silent regressions in the underlying `ring` HKDF implementation.
 #[test]
 fn hkdf_sha256_known_answer() {
-    let ikm  = [0x0bu8; 32];
+    let ikm = [0x0bu8; 32];
     let salt = b"smrp-test-salt";
     let info = b"smrp-test-info";
     let out1 = hkdf_sha256(&ikm, salt, info).unwrap();
@@ -68,16 +71,19 @@ fn hkdf_sha256_known_answer() {
 
 #[test]
 fn hkdf_sha256_info_domain_separation() {
-    let ikm  = [0x42u8; 32];
+    let ikm = [0x42u8; 32];
     let salt = b"salt";
     let out_c2s = hkdf_sha256(&ikm, salt, b"smrp-v1-c2s").unwrap();
     let out_s2c = hkdf_sha256(&ikm, salt, b"smrp-v1-s2c").unwrap();
-    assert_ne!(out_c2s, out_s2c, "different info strings must produce different outputs");
+    assert_ne!(
+        out_c2s, out_s2c,
+        "different info strings must produce different outputs"
+    );
 }
 
 #[test]
 fn hkdf_sha256_salt_domain_separation() {
-    let ikm  = [0x42u8; 32];
+    let ikm = [0x42u8; 32];
     let out1 = hkdf_sha256(&ikm, b"salt-a", b"info").unwrap();
     let out2 = hkdf_sha256(&ikm, b"salt-b", b"info").unwrap();
     assert_ne!(out1, out2, "different salts must produce different outputs");
@@ -129,7 +135,11 @@ fn make_nonce_prefix_in_low_bytes() {
     let prefix = [0xAA, 0xBB, 0xCC, 0xDD];
     let nonce = make_nonce(&prefix, 0);
     assert_eq!(&nonce[0..4], &prefix, "prefix must occupy bytes 0..4");
-    assert_eq!(&nonce[4..12], &0u64.to_be_bytes(), "seq=0 must produce zero bytes 4..12");
+    assert_eq!(
+        &nonce[4..12],
+        &0u64.to_be_bytes(),
+        "seq=0 must produce zero bytes 4..12"
+    );
 }
 
 #[test]
@@ -157,9 +167,9 @@ fn fresh_key() -> SessionKey {
 
 #[test]
 fn seal_open_roundtrip() {
-    let key   = fresh_key();
+    let key = fresh_key();
     let nonce = make_nonce(&[1, 2, 3, 4], 42);
-    let aad   = b"additional-data";
+    let aad = b"additional-data";
     let plain = b"hello, smrp test vector";
 
     let ct = key.seal(&nonce, aad, plain).unwrap();
@@ -169,15 +179,19 @@ fn seal_open_roundtrip() {
 
 #[test]
 fn seal_empty_plaintext_produces_16_byte_tag() {
-    let key   = fresh_key();
+    let key = fresh_key();
     let nonce = make_nonce(&[0; 4], 0);
     let ct = key.seal(&nonce, b"aad", &[]).unwrap();
-    assert_eq!(ct.len(), 16, "sealing empty plaintext must produce a 16-byte tag");
+    assert_eq!(
+        ct.len(),
+        16,
+        "sealing empty plaintext must produce a 16-byte tag"
+    );
 }
 
 #[test]
 fn open_empty_ciphertext_returns_empty_plaintext() {
-    let key   = fresh_key();
+    let key = fresh_key();
     let nonce = make_nonce(&[0; 4], 0);
     let ct = key.seal(&nonce, b"aad", &[]).unwrap();
     let pt = key.open(&nonce, b"aad", &ct).unwrap();
@@ -186,29 +200,38 @@ fn open_empty_ciphertext_returns_empty_plaintext() {
 
 #[test]
 fn tampered_ciphertext_rejected() {
-    let key   = fresh_key();
+    let key = fresh_key();
     let nonce = make_nonce(&[0; 4], 1);
-    let aad   = b"aad";
+    let aad = b"aad";
     let mut ct = key.seal(&nonce, aad, b"secret payload").unwrap();
     ct[0] ^= 0xFF; // flip a bit
-    assert!(key.open(&nonce, aad, &ct).is_err(), "tampered ciphertext must be rejected");
+    assert!(
+        key.open(&nonce, aad, &ct).is_err(),
+        "tampered ciphertext must be rejected"
+    );
 }
 
 #[test]
 fn wrong_aad_rejected() {
-    let key   = fresh_key();
+    let key = fresh_key();
     let nonce = make_nonce(&[0; 4], 2);
     let ct = key.seal(&nonce, b"correct-aad", b"payload").unwrap();
-    assert!(key.open(&nonce, b"wrong-aad", &ct).is_err(), "wrong AAD must be rejected");
+    assert!(
+        key.open(&nonce, b"wrong-aad", &ct).is_err(),
+        "wrong AAD must be rejected"
+    );
 }
 
 #[test]
 fn wrong_nonce_rejected() {
-    let key    = fresh_key();
+    let key = fresh_key();
     let nonce1 = make_nonce(&[1, 0, 0, 0], 0);
     let nonce2 = make_nonce(&[2, 0, 0, 0], 0);
     let ct = key.seal(&nonce1, b"aad", b"payload").unwrap();
-    assert!(key.open(&nonce2, b"aad", &ct).is_err(), "wrong nonce must be rejected");
+    assert!(
+        key.open(&nonce2, b"aad", &ct).is_err(),
+        "wrong nonce must be rejected"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -220,8 +243,7 @@ fn ed25519_sign_verify_roundtrip() {
     let key = SigningKey::generate().unwrap();
     let msg = b"test message for ed25519 vector";
     let sig = key.sign(msg);
-    ed25519_verify(key.public_key_bytes(), msg, &sig)
-        .expect("valid signature must verify");
+    ed25519_verify(key.public_key_bytes(), msg, &sig).expect("valid signature must verify");
 }
 
 #[test]
@@ -229,17 +251,23 @@ fn ed25519_wrong_message_rejected() {
     let key = SigningKey::generate().unwrap();
     let sig = key.sign(b"original message");
     let result = ed25519_verify(key.public_key_bytes(), b"tampered message", &sig);
-    assert!(result.is_err(), "signature over different message must be rejected");
+    assert!(
+        result.is_err(),
+        "signature over different message must be rejected"
+    );
 }
 
 #[test]
 fn ed25519_wrong_key_rejected() {
-    let signer   = SigningKey::generate().unwrap();
+    let signer = SigningKey::generate().unwrap();
     let verifier = SigningKey::generate().unwrap();
-    let msg      = b"message";
-    let sig      = signer.sign(msg);
-    let result   = ed25519_verify(verifier.public_key_bytes(), msg, &sig);
-    assert!(result.is_err(), "signature verified under wrong key must be rejected");
+    let msg = b"message";
+    let sig = signer.sign(msg);
+    let result = ed25519_verify(verifier.public_key_bytes(), msg, &sig);
+    assert!(
+        result.is_err(),
+        "signature verified under wrong key must be rejected"
+    );
 }
 
 #[test]
@@ -254,9 +282,9 @@ fn ed25519_tampered_signature_rejected() {
 
 #[test]
 fn ed25519_pkcs8_roundtrip_preserves_key() {
-    let key   = SigningKey::generate().unwrap();
+    let key = SigningKey::generate().unwrap();
     let bytes = key.to_pkcs8().to_vec();
-    let key2  = SigningKey::from_pkcs8(&bytes).unwrap();
+    let key2 = SigningKey::from_pkcs8(&bytes).unwrap();
     assert_eq!(key.public_key_bytes(), key2.public_key_bytes());
     // Both keys must produce equivalent signatures.
     let msg = b"pkcs8 roundtrip vector";

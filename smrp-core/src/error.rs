@@ -56,17 +56,17 @@ impl SmrpError {
     #[must_use]
     pub fn wire_code(&self) -> u8 {
         match self {
-            Self::NoError               => 0x00,
-            Self::MalformedHeader       => 0x01,
-            Self::InvalidMagic          => 0x02,
-            Self::UnsupportedVersion    => 0x03,
+            Self::NoError => 0x00,
+            Self::MalformedHeader => 0x01,
+            Self::InvalidMagic => 0x02,
+            Self::UnsupportedVersion => 0x03,
             Self::AuthenticationFailure => 0x04,
-            Self::UnknownSession        => 0x05,
-            Self::ReplayDetected        => 0x06,
-            Self::HandshakeTimeout      => 0x07,
-            Self::SessionLimitExceeded  => 0x08,
-            Self::PayloadTooLarge       => 0x09,
-            Self::InternalError         => 0x0A,
+            Self::UnknownSession => 0x05,
+            Self::ReplayDetected => 0x06,
+            Self::HandshakeTimeout => 0x07,
+            Self::SessionLimitExceeded => 0x08,
+            Self::PayloadTooLarge => 0x09,
+            Self::InternalError => 0x0A,
         }
     }
 
@@ -85,7 +85,7 @@ impl SmrpError {
             0x07 => Self::HandshakeTimeout,
             0x08 => Self::SessionLimitExceeded,
             0x09 => Self::PayloadTooLarge,
-            _    => Self::InternalError,
+            _ => Self::InternalError,
         }
     }
 }
@@ -96,17 +96,17 @@ mod tests {
     use super::*;
 
     const ALL_VARIANTS: &[(SmrpError, u8)] = &[
-        (SmrpError::NoError,               0x00),
-        (SmrpError::MalformedHeader,       0x01),
-        (SmrpError::InvalidMagic,          0x02),
-        (SmrpError::UnsupportedVersion,    0x03),
+        (SmrpError::NoError, 0x00),
+        (SmrpError::MalformedHeader, 0x01),
+        (SmrpError::InvalidMagic, 0x02),
+        (SmrpError::UnsupportedVersion, 0x03),
         (SmrpError::AuthenticationFailure, 0x04),
-        (SmrpError::UnknownSession,        0x05),
-        (SmrpError::ReplayDetected,        0x06),
-        (SmrpError::HandshakeTimeout,      0x07),
-        (SmrpError::SessionLimitExceeded,  0x08),
-        (SmrpError::PayloadTooLarge,       0x09),
-        (SmrpError::InternalError,         0x0A),
+        (SmrpError::UnknownSession, 0x05),
+        (SmrpError::ReplayDetected, 0x06),
+        (SmrpError::HandshakeTimeout, 0x07),
+        (SmrpError::SessionLimitExceeded, 0x08),
+        (SmrpError::PayloadTooLarge, 0x09),
+        (SmrpError::InternalError, 0x0A),
     ];
 
     #[test]

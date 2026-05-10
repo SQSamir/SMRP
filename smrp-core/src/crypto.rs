@@ -84,9 +84,14 @@ impl SessionKey {
     ///
     /// # Errors
     /// Returns [`SmrpError::InternalError`] on failure.
-    pub fn seal(&self, nonce: &[u8; 12], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, SmrpError> {
-        let nonce_val = aead::Nonce::try_assume_unique_for_key(nonce)
-            .map_err(|_| SmrpError::InternalError)?;
+    pub fn seal(
+        &self,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, SmrpError> {
+        let nonce_val =
+            aead::Nonce::try_assume_unique_for_key(nonce).map_err(|_| SmrpError::InternalError)?;
         let mut in_out = plaintext.to_vec();
         self.inner
             .seal_in_place_append_tag(nonce_val, aead::Aad::from(aad), &mut in_out)
@@ -98,9 +103,14 @@ impl SessionKey {
     ///
     /// # Errors
     /// Returns [`SmrpError::AuthenticationFailure`] on tag mismatch.
-    pub fn open(&self, nonce: &[u8; 12], aad: &[u8], ciphertext_with_tag: &[u8]) -> Result<Vec<u8>, SmrpError> {
-        let nonce_val = aead::Nonce::try_assume_unique_for_key(nonce)
-            .map_err(|_| SmrpError::InternalError)?;
+    pub fn open(
+        &self,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        ciphertext_with_tag: &[u8],
+    ) -> Result<Vec<u8>, SmrpError> {
+        let nonce_val =
+            aead::Nonce::try_assume_unique_for_key(nonce).map_err(|_| SmrpError::InternalError)?;
         let mut in_out = ciphertext_with_tag.to_vec();
         let plaintext_len = self
             .inner
@@ -137,10 +147,10 @@ pub fn hkdf_sha256(ikm: &[u8; 32], salt: &[u8], info: &[u8]) -> Result<[u8; 32],
 
 /// An Ed25519 signing key pair with support for PKCS#8 persistence.
 pub struct SigningKey {
-    inner:        ring_sig::Ed25519KeyPair,
+    inner: ring_sig::Ed25519KeyPair,
     public_bytes: [u8; 32],
     /// Raw PKCS#8 DER bytes — retained so the key can be saved to disk.
-    pkcs8_bytes:  Vec<u8>,
+    pkcs8_bytes: Vec<u8>,
 }
 
 impl SigningKey {
@@ -150,8 +160,8 @@ impl SigningKey {
     /// Returns [`SmrpError::InternalError`] if the RNG is unavailable.
     pub fn generate() -> Result<Self, SmrpError> {
         let rng = rand::SystemRandom::new();
-        let pkcs8_doc = ring_sig::Ed25519KeyPair::generate_pkcs8(&rng)
-            .map_err(|_| SmrpError::InternalError)?;
+        let pkcs8_doc =
+            ring_sig::Ed25519KeyPair::generate_pkcs8(&rng).map_err(|_| SmrpError::InternalError)?;
         Self::from_pkcs8(pkcs8_doc.as_ref())
     }
 
@@ -163,8 +173,8 @@ impl SigningKey {
     /// Returns [`SmrpError::InternalError`] if the bytes are not a valid
     /// Ed25519 PKCS#8 document.
     pub fn from_pkcs8(bytes: &[u8]) -> Result<Self, SmrpError> {
-        let inner = ring_sig::Ed25519KeyPair::from_pkcs8(bytes)
-            .map_err(|_| SmrpError::InternalError)?;
+        let inner =
+            ring_sig::Ed25519KeyPair::from_pkcs8(bytes).map_err(|_| SmrpError::InternalError)?;
         let mut public_bytes = [0u8; 32];
         public_bytes.copy_from_slice(inner.public_key().as_ref());
         Ok(Self {

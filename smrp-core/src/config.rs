@@ -44,7 +44,6 @@ pub struct SmrpConfig {
     pub accept_queue_capacity: usize,
 
     // ---- Retransmission -------------------------------------------------------
-
     /// Maximum number of retransmission attempts per DATA packet before the
     /// session is declared dead. Default: 5.
     pub max_retransmits: u32,
@@ -62,14 +61,12 @@ pub struct SmrpConfig {
     pub rto_max: Duration,
 
     // ---- Congestion control --------------------------------------------------
-
     /// Initial congestion window — maximum DATA packets in flight before the
     /// first ACK arrives. Uses slow-start from this value up to `ssthresh`,
     /// then switches to AIMD congestion avoidance. Default: 4.
     pub initial_cwnd: usize,
 
     // ---- Receive reorder buffer ---------------------------------------------
-
     /// Maximum out-of-order DATA packets held in the receive reorder buffer.
     /// Packets that would exceed this limit are dropped (and retransmitted by
     /// the peer). Default: 256.
@@ -79,22 +76,22 @@ pub struct SmrpConfig {
 impl Default for SmrpConfig {
     fn default() -> Self {
         Self {
-            keepalive_interval:       Duration::from_secs(15),
-            session_dead_timeout:     Duration::from_secs(45),
-            hello_clock_skew:         Duration::from_secs(30),
-            hello_rate_limit:         10,
-            max_sessions:             100_000,
-            connect_timeout:          Duration::from_secs(10),
-            recv_timeout:             Duration::from_mins(1),
-            fin_ack_timeout:          Duration::from_secs(5),
+            keepalive_interval: Duration::from_secs(15),
+            session_dead_timeout: Duration::from_secs(45),
+            hello_clock_skew: Duration::from_secs(30),
+            hello_rate_limit: 10,
+            max_sessions: 100_000,
+            connect_timeout: Duration::from_secs(10),
+            recv_timeout: Duration::from_mins(1),
+            fin_ack_timeout: Duration::from_secs(5),
             session_channel_capacity: 256,
-            accept_queue_capacity:    64,
-            max_retransmits:          5,
-            rto_initial:              Duration::from_millis(200),
-            rto_min:                  Duration::from_millis(50),
-            rto_max:                  Duration::from_secs(30),
-            initial_cwnd:             4,
-            recv_buf_limit:           256,
+            accept_queue_capacity: 64,
+            max_retransmits: 5,
+            rto_initial: Duration::from_millis(200),
+            rto_min: Duration::from_millis(50),
+            rto_max: Duration::from_secs(30),
+            initial_cwnd: 4,
+            recv_buf_limit: 256,
         }
     }
 }

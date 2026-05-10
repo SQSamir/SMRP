@@ -191,7 +191,7 @@ mod tests {
     #[test]
     fn failed_decrypt_does_not_poison_window() {
         let w = window_with(&[5]); // highest=5
-        // Suppose seq=6 arrives but AEAD fails — we only called can_accept, not mark_seen.
+                                   // Suppose seq=6 arrives but AEAD fails — we only called can_accept, not mark_seen.
         w.can_accept(6).unwrap();
         // Window state unchanged: seq=6 is still acceptable for the real retransmit.
         assert!(w.can_accept(6).is_ok());
@@ -202,7 +202,7 @@ mod tests {
         let mut w = window_with(&[5]);
         w.can_accept(6).unwrap();
         w.mark_seen(6); // AEAD succeeded
-        // Now replay of 6 is rejected
+                        // Now replay of 6 is rejected
         assert_eq!(w.can_accept(6), Err(SmrpError::ReplayDetected));
     }
 
@@ -225,7 +225,10 @@ mod tests {
     fn full_window_cycle() {
         let mut w = ReplayWindow::new();
         for seq in 0u64..256 {
-            assert!(w.can_accept(seq).is_ok(), "initial accept failed at seq={seq}");
+            assert!(
+                w.can_accept(seq).is_ok(),
+                "initial accept failed at seq={seq}"
+            );
             w.mark_seen(seq);
         }
         // All 256 seen; anything below 256-128=128 is now too old

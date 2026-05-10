@@ -1,4 +1,6 @@
-use crate::{constants::SESSION_ID_LEN, crypto::SessionKey, error::SmrpError, replay::ReplayWindow};
+use crate::{
+    constants::SESSION_ID_LEN, crypto::SessionKey, error::SmrpError, replay::ReplayWindow,
+};
 use std::net::SocketAddr;
 
 /// Opaque identifier that uniquely names an SMRP session for its lifetime.

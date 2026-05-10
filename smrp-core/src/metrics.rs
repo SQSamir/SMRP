@@ -61,19 +61,19 @@ impl SmrpMetrics {
     #[must_use]
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
-            sessions_active:         self.sessions_active.load(Ordering::Relaxed),
-            sessions_total:          self.sessions_total.load(Ordering::Relaxed),
-            sessions_evicted_dead:   self.sessions_evicted_dead.load(Ordering::Relaxed),
-            hello_drops_rate_limit:  self.hello_drops_rate_limit.load(Ordering::Relaxed),
-            hello_drops_clock_skew:  self.hello_drops_clock_skew.load(Ordering::Relaxed),
-            hello_drops_capacity:    self.hello_drops_capacity.load(Ordering::Relaxed),
-            packets_sent:            self.packets_sent.load(Ordering::Relaxed),
-            packets_received:        self.packets_received.load(Ordering::Relaxed),
-            bytes_sent:              self.bytes_sent.load(Ordering::Relaxed),
-            bytes_received:          self.bytes_received.load(Ordering::Relaxed),
-            packets_retransmitted:   self.packets_retransmitted.load(Ordering::Relaxed),
-            auth_failures:           self.auth_failures.load(Ordering::Relaxed),
-            replay_detections:       self.replay_detections.load(Ordering::Relaxed),
+            sessions_active: self.sessions_active.load(Ordering::Relaxed),
+            sessions_total: self.sessions_total.load(Ordering::Relaxed),
+            sessions_evicted_dead: self.sessions_evicted_dead.load(Ordering::Relaxed),
+            hello_drops_rate_limit: self.hello_drops_rate_limit.load(Ordering::Relaxed),
+            hello_drops_clock_skew: self.hello_drops_clock_skew.load(Ordering::Relaxed),
+            hello_drops_capacity: self.hello_drops_capacity.load(Ordering::Relaxed),
+            packets_sent: self.packets_sent.load(Ordering::Relaxed),
+            packets_received: self.packets_received.load(Ordering::Relaxed),
+            bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
+            bytes_received: self.bytes_received.load(Ordering::Relaxed),
+            packets_retransmitted: self.packets_retransmitted.load(Ordering::Relaxed),
+            auth_failures: self.auth_failures.load(Ordering::Relaxed),
+            replay_detections: self.replay_detections.load(Ordering::Relaxed),
         }
     }
 }
@@ -81,17 +81,17 @@ impl SmrpMetrics {
 /// A point-in-time copy of all [`SmrpMetrics`] counters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetricsSnapshot {
-    pub sessions_active:         u64,
-    pub sessions_total:          u64,
-    pub sessions_evicted_dead:   u64,
-    pub hello_drops_rate_limit:  u64,
-    pub hello_drops_clock_skew:  u64,
-    pub hello_drops_capacity:    u64,
-    pub packets_sent:            u64,
-    pub packets_received:        u64,
-    pub bytes_sent:              u64,
-    pub bytes_received:          u64,
-    pub packets_retransmitted:   u64,
-    pub auth_failures:           u64,
-    pub replay_detections:       u64,
+    pub sessions_active: u64,
+    pub sessions_total: u64,
+    pub sessions_evicted_dead: u64,
+    pub hello_drops_rate_limit: u64,
+    pub hello_drops_clock_skew: u64,
+    pub hello_drops_capacity: u64,
+    pub packets_sent: u64,
+    pub packets_received: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub packets_retransmitted: u64,
+    pub auth_failures: u64,
+    pub replay_detections: u64,
 }
