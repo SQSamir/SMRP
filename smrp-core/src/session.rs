@@ -73,6 +73,14 @@ pub struct Session {
     pub peer_sign_pub: Option<[u8; 32]>,
     /// Anti-replay window for incoming DATA packets.
     pub recv_replay: ReplayWindow,
+    /// HKDF-derived nonce prefix for outgoing DATA packets.
+    pub data_send_nonce_prefix: [u8; 4],
+    /// HKDF-derived nonce prefix for incoming DATA packets.
+    pub data_recv_nonce_prefix: [u8; 4],
+    /// HKDF-derived nonce prefix for outgoing authenticated control packets.
+    pub ctrl_send_nonce_prefix: [u8; 4],
+    /// HKDF-derived nonce prefix for incoming authenticated control packets.
+    pub ctrl_recv_nonce_prefix: [u8; 4],
 }
 
 impl Session {

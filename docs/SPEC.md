@@ -1,9 +1,19 @@
 # SMRP Protocol Specification
 
-**Version:** 0.6  
+**Version:** 0.7  
 **Status:** Draft  
 **Authors:** Samir Gasimov
 
+> **Changelog v0.6→v0.7 (wire-breaking; version byte 0x02):**
+> HKDF-derived nonce prefixes (§7.2) — `packet_nonce` replaced by four
+> per-direction, per-domain prefixes derived from session keys via HKDF; full
+> 54-byte header as DATA AAD with `timestamp_us` zeroed for retransmit safety;
+> authenticated control packets (§8.7) — ACK, KEEPALIVE_ACK, RESET, PING, PONG
+> carry a 16-byte Poly1305 MAC tag sealed under the sender's session key with a
+> HKDF-derived ctrl nonce prefix; FIN/FIN_ACK remain unauthenticated to support
+> listener shutdown; `connect_with_pinned_server_key()` API (§15.6); test
+> vectors (§16); protocol version byte bumped to `0x02`.
+>
 > **Changelog v0.5→v0.6:** In-band key update implemented (§12) — `KEY_UPDATE`
 > and `KEY_UPDATE_ACK` are now fully handled; `request_key_update()` API added;
 > Ed25519 identity pinning enforced on rekey; `smrp-v1-rekey-c2s` /

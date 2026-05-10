@@ -8,7 +8,7 @@
 /// ```
 use crate::{
     constants::{SMRP_MAGIC, SMRP_VERSION},
-    crypto::{self, EphemeralKeypair, SessionKey, SigningKey},
+    crypto::{self, derive_nonce_prefix, EphemeralKeypair, SessionKey, SigningKey},
     error::SmrpError,
     packet::{self, Flags, PacketType, SmrpHeader},
     replay::ReplayWindow,
@@ -66,14 +66,32 @@ fn parse_hello_payload(
     Ok((eph_pub, sign_pub))
 }
 
-fn derive_keys(
+struct DerivedKeys {
+    c2s:      [u8; 32],
+    s2c:      [u8; 32],
+    data_c2s: [u8; 4],
+    data_s2c: [u8; 4],
+    ctrl_c2s: [u8; 4],
+    ctrl_s2c: [u8; 4],
+}
+
+/// Derives session encryption keys and HKDF nonce prefixes from a shared secret.
+fn derive_keys_and_prefixes(
     shared: &[u8; 32],
     session_id: SessionId,
-) -> Result<([u8; 32], [u8; 32]), SmrpError> {
+) -> Result<DerivedKeys, SmrpError> {
     let salt = session_id.as_bytes().as_ref();
     let c2s = crypto::hkdf_sha256(shared, salt, b"smrp-v1-c2s")?;
     let s2c = crypto::hkdf_sha256(shared, salt, b"smrp-v1-s2c")?;
-    Ok((c2s, s2c))
+
+    Ok(DerivedKeys {
+        data_c2s: derive_nonce_prefix(&c2s, b"smrp-v1-data-nonce-c2s")?,
+        data_s2c: derive_nonce_prefix(&s2c, b"smrp-v1-data-nonce-s2c")?,
+        ctrl_c2s: derive_nonce_prefix(&c2s, b"smrp-v1-ctrl-nonce-c2s")?,
+        ctrl_s2c: derive_nonce_prefix(&s2c, b"smrp-v1-ctrl-nonce-s2c")?,
+        c2s,
+        s2c,
+    })
 }
 
 fn make_header(
@@ -104,7 +122,7 @@ fn make_header(
 /// Performs the full client-side SMRP handshake.
 ///
 /// Sends `HELLO` to `server_addr`, waits for `HELLO_ACK`, derives session
-/// keys, and returns a fully [`SessionState::Established`] [`Session`].
+/// keys and nonce prefixes, and returns a fully [`SessionState::Established`] [`Session`].
 ///
 /// # Errors
 /// Propagates [`SmrpError`] on any crypto, network, or protocol failure.
@@ -130,18 +148,23 @@ pub async fn client_handshake(
         parse_hello_payload(&ack_payload, session_id)?;
 
     let shared = eph.agree(&server_eph_pub)?;
-    let (c2s_raw, s2c_raw) = derive_keys(&shared, session_id)?;
+    let dk = derive_keys_and_prefixes(&shared, session_id)?;
 
     Ok(Session {
         id: session_id,
         state: SessionState::Established,
         peer_addr: server_addr,
-        send_key: Some(SessionKey::from_raw(&c2s_raw)?),
-        recv_key: Some(SessionKey::from_raw(&s2c_raw)?),
+        send_key: Some(SessionKey::from_raw(&dk.c2s)?),
+        recv_key: Some(SessionKey::from_raw(&dk.s2c)?),
         send_seq: 1,
         recv_seq: 0,
         peer_sign_pub: Some(server_sign_pub),
         recv_replay: ReplayWindow::new(),
+        // Client sends c2s and receives s2c.
+        data_send_nonce_prefix: dk.data_c2s,
+        data_recv_nonce_prefix: dk.data_s2c,
+        ctrl_send_nonce_prefix: dk.ctrl_c2s,
+        ctrl_recv_nonce_prefix: dk.ctrl_s2c,
     })
 }
 
@@ -152,7 +175,8 @@ pub async fn client_handshake(
 /// Performs the server-side SMRP handshake in response to an incoming `HELLO`.
 ///
 /// Parses and verifies `hello_payload`, generates a server ephemeral key,
-/// derives session keys, sends `HELLO_ACK`, and returns an established [`Session`].
+/// derives session keys and nonce prefixes, sends `HELLO_ACK`, and returns an
+/// established [`Session`].
 ///
 /// # Errors
 /// Propagates [`SmrpError`] on any crypto, network, or protocol failure.
@@ -170,7 +194,7 @@ pub async fn server_handshake(
     let ack_payload = build_hello_payload(&server_eph, server_sign_key, session_id);
 
     let shared = server_eph.agree(&client_eph_pub)?;
-    let (c2s_raw, s2c_raw) = derive_keys(&shared, session_id)?;
+    let dk = derive_keys_and_prefixes(&shared, session_id)?;
 
     let ack_hdr = make_header(PacketType::HelloAck, session_id, 0, 0, ack_payload.len());
     transport::send_raw(socket, client_addr, &ack_hdr, &ack_payload).await?;
@@ -180,113 +204,16 @@ pub async fn server_handshake(
         id: session_id,
         state: SessionState::Established,
         peer_addr: client_addr,
-        send_key: Some(SessionKey::from_raw(&s2c_raw)?),
-        recv_key: Some(SessionKey::from_raw(&c2s_raw)?),
+        send_key: Some(SessionKey::from_raw(&dk.s2c)?),
+        recv_key: Some(SessionKey::from_raw(&dk.c2s)?),
         send_seq: 1,
         recv_seq: 0,
         peer_sign_pub: Some(client_sign_pub),
         recv_replay: ReplayWindow::new(),
+        // Server sends s2c and receives c2s.
+        data_send_nonce_prefix: dk.data_s2c,
+        data_recv_nonce_prefix: dk.data_c2s,
+        ctrl_send_nonce_prefix: dk.ctrl_s2c,
+        ctrl_recv_nonce_prefix: dk.ctrl_c2s,
     })
-}
-
-// ---------------------------------------------------------------------------
-// Shared data-plane helpers
-// ---------------------------------------------------------------------------
-
-/// Encrypts `plaintext` and sends it as a `DATA` packet over an established session.
-///
-/// Uses the serialised header as AEAD additional data, so any header tampering
-/// is detected on decryption.
-///
-/// # Errors
-/// Returns [`SmrpError::InternalError`] if the session has no send key.
-pub async fn send_data(
-    socket: &UdpSocket,
-    session: &mut Session,
-    plaintext: &[u8],
-) -> Result<(), SmrpError> {
-    let key = session.send_key.as_ref().ok_or(SmrpError::InternalError)?;
-    let seq = session.send_seq;
-    let nonce = crypto::packet_nonce(session.id.as_bytes(), seq);
-
-    // AAD = session_id || seq — unambiguous on both sides regardless of payload_len.
-    let mut aad = [0u8; 16];
-    aad[0..8].copy_from_slice(session.id.as_bytes());
-    aad[8..16].copy_from_slice(&seq.to_be_bytes());
-    let ciphertext = key.seal(&nonce, &aad, plaintext)?;
-
-    let hdr_with_len = make_header(
-        PacketType::Data,
-        session.id,
-        seq,
-        session.recv_seq,
-        ciphertext.len(),
-    );
-    transport::send_raw(socket, session.peer_addr, &hdr_with_len, &ciphertext).await?;
-    session.send_seq += 1;
-    Ok(())
-}
-
-/// Decrypts a `DATA` packet payload received on `session`.
-///
-/// Enforces anti-replay protection with a two-phase check:
-/// the sequence number is validated **before** decryption so that a forged
-/// packet cannot permanently consume a slot in the replay window, and the
-/// window is only updated **after** successful AEAD authentication.
-///
-/// # Errors
-/// Returns [`SmrpError::ReplayDetected`] if the sequence number has already
-/// been seen or is outside the 128-packet window, [`SmrpError::AuthenticationFailure`]
-/// on AEAD tag mismatch, or [`SmrpError::InternalError`] if the session has no
-/// receive key.
-pub fn decrypt_data(
-    session: &mut Session,
-    hdr: &SmrpHeader,
-    ciphertext: &[u8],
-) -> Result<Vec<u8>, SmrpError> {
-    let seq = hdr.sequence_number;
-
-    // Phase 1 — reject replays and out-of-window packets without touching crypto.
-    session.recv_replay.can_accept(seq)?;
-
-    let key = session.recv_key.as_ref().ok_or(SmrpError::InternalError)?;
-    let nonce = crypto::packet_nonce(session.id.as_bytes(), seq);
-
-    // Must match the AAD constructed in send_data.
-    let mut aad = [0u8; 16];
-    aad[0..8].copy_from_slice(session.id.as_bytes());
-    aad[8..16].copy_from_slice(&seq.to_be_bytes());
-
-    // Phase 2 — AEAD open (expensive; only runs if the seq passed phase 1).
-    let plaintext = key.open(&nonce, &aad, ciphertext)?;
-
-    // Phase 3 — commit: mark seq as seen only after authenticated decryption.
-    session.recv_replay.mark_seen(seq);
-    session.recv_seq = seq;
-    Ok(plaintext)
-}
-
-/// Sends a zero-payload `ACK` for the given sequence number.
-///
-/// # Errors
-/// Returns [`SmrpError::InternalError`] on socket failure.
-pub async fn send_ack(
-    socket: &UdpSocket,
-    session: &Session,
-    ack_seq: u64,
-) -> Result<(), SmrpError> {
-    let hdr = make_header(PacketType::Ack, session.id, session.send_seq, ack_seq, 0);
-    transport::send_raw(socket, session.peer_addr, &hdr, &[]).await
-}
-
-/// Sends a `FIN` packet and marks the session as `Closing`.
-///
-/// # Errors
-/// Returns [`SmrpError::InternalError`] on socket failure.
-pub async fn send_fin(socket: &UdpSocket, session: &mut Session) -> Result<(), SmrpError> {
-    let mut hdr = make_header(PacketType::Fin, session.id, session.send_seq, session.recv_seq, 0);
-    hdr.flags.0 |= Flags::FIN;
-    transport::send_raw(socket, session.peer_addr, &hdr, &[]).await?;
-    session.state = SessionState::Closing;
-    Ok(())
 }

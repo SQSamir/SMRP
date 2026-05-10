@@ -24,6 +24,9 @@ a minimal, auditable implementation in safe Rust.
 - **Ordered delivery** — out-of-order DATA packets are buffered and delivered to the application in send order
 - **AIMD congestion control** — slow-start + AIMD congestion avoidance; `send()` backpressures when the congestion window is full
 - **In-band key update** — `request_key_update()` rotates session keys mid-stream via X25519 + HKDF without a full re-handshake; Ed25519 identity pinning prevents impersonation
+- **HKDF-derived nonce prefixes** — four independent 4-byte prefixes (data-c2s/s2c, ctrl-c2s/s2c) eliminate client-controlled nonce input; full 54-byte header as DATA AEAD additional data
+- **Authenticated control packets** — ACK, KEEPALIVE_ACK, RESET, PING, PONG carry a 16-byte Poly1305 MAC tag; prevents injection of fake ACKs and RESETs
+- **Server identity pinning** — `connect_with_pinned_server_key()` verifies the server's Ed25519 fingerprint after the handshake; TOFU-compatible
 - **RESET / PING / PONG** — immediate abort, RTT probing (echoes timestamp_us for clock-free RTT measurement)
 - **Persistent signing identity** — Ed25519 PKCS#8 `to_pkcs8` / `from_pkcs8`; `bind_with_config_and_key` for stable server fingerprint
 - **Graceful teardown** — FIN / FIN_ACK exchange; configurable `fin_ack_timeout`
@@ -195,6 +198,17 @@ println!("active={} total={} retransmits={} auth_failures={}",
     snap.packets_retransmitted, snap.auth_failures);
 ```
 
+### Client with pinned server key
+
+```rust
+use smrp_core::conn::SmrpConnection;
+
+// `pinned` is the server's 32-byte Ed25519 public key obtained out-of-band.
+let pinned: [u8; 32] = /* loaded from config or first-use TOFU */ [0u8; 32];
+let mut conn = SmrpConnection::connect_with_pinned_server_key("127.0.0.1:9000", &pinned).await?;
+// Returns AuthenticationFailure if the server's key doesn't match pinned.
+```
+
 ### Persistent server identity
 
 ```rust
@@ -263,7 +277,7 @@ smrp/
 cargo test --workspace
 ```
 
-**55 tests** across all modules:
+**82 tests** across all modules:
 
 | Module      | Tests | Coverage                                                          |
 |-------------|-------|-------------------------------------------------------------------|
@@ -272,10 +286,14 @@ cargo test --workspace
 | `packet`    | 13    | Parse/serialize, all 14 packet types, flag bits                   |
 | `session`   | 3     | SessionId equality, state copy                                    |
 | `replay`    | 11    | In-order, replay, out-of-order, two-phase, window slide           |
-| `conn`      | 17    | Round-trip, concurrency, max payload, timeouts, FIN/FIN_ACK,      |
+| `conn`      | 19    | Round-trip, concurrency, max payload, timeouts, FIN/FIN_ACK,      |
 |             |       | metrics, custom config, shutdown, no-accept-after-shutdown,       |
 |             |       | retransmit-buffer drain, PKCS8 roundtrip, persistent key bind,    |
-|             |       | ordered delivery, congestion window backpressure, key rotation     |
+|             |       | ordered delivery, congestion window backpressure, key rotation,   |
+|             |       | pinned-key accept, pinned-key reject                              |
+| `vectors`   | 23    | X25519 DH symmetry, HKDF determinism/domain-sep, nonce prefix     |
+|             |       | isolation, `make_nonce` layout, ChaCha20-Poly1305 seal/open/      |
+|             |       | tamper/wrong-AAD/wrong-nonce, Ed25519 sign/verify/tamper/pkcs8    |
 | doc-tests   | 2     | API examples compile and run                                      |
 
 ### Running Fuzz Targets
@@ -309,13 +327,14 @@ cargo +nightly fuzz run fuzz_replay_window
 | Forward secrecy           | Ephemeral X25519 key exchange per session              |
 | Replay protection         | RFC 6479 sliding window (128 packets), two-phase       |
 | Key separation            | HKDF derives independent c→s and s→c keys             |
-| Nonce uniqueness          | session_id[0..4] ‖ seq_u64_be — unique per packet     |
-| AAD coverage              | session_id ‖ seq committed into every AEAD tag         |
+| Nonce uniqueness          | HKDF-derived 4-byte prefix ‖ seq_u64_be; separate prefixes per direction and domain (data/ctrl) |
+| AAD coverage              | Full 54-byte header (timestamp_us zeroed) for DATA; full header for ctrl |
 | HELLO replay defence      | ±30 s timestamp validation on all HELLO packets        |
 | DoS — HELLO flood         | 10 HELLO/IP/s rate limit before any crypto runs        |
 | DoS — session exhaustion  | MAX_SESSIONS hard cap with ERROR reply                 |
 | Dead session cleanup      | Idle sessions evicted automatically after 45 s         |
-| Server identity pinning   | Persistent Ed25519 key via PKCS#8; stable fingerprint  |
+| Server identity pinning   | Persistent Ed25519 key via PKCS#8; `connect_with_pinned_server_key()` enforces fingerprint |
+| Control packet integrity  | ACK, KEEPALIVE_ACK, RESET, PING, PONG carry Poly1305 MAC; injected fakes rejected |
 | Reliable delivery         | Per-packet retransmit buffer; Jacobson/Karels RTO      |
 | Ordered delivery          | Reorder buffer delivers application data in send order |
 | Congestion control        | AIMD slow-start + congestion avoidance; cwnd backpressure |
@@ -327,7 +346,8 @@ cargo +nightly fuzz run fuzz_replay_window
 - Basic congestion control only — no ECN, pacing, or bandwidth estimation; sequential `&mut self` API means send and recv cannot run concurrently on one connection
 - No fragmentation — payloads over 1 280 bytes must be split by the caller
 - Key update sequencing constraint — retransmit buffer must be empty before `request_key_update()`; in-flight packets at rekey time cause session death
-- Nonce uses only 32 bits of session ID entropy; full 64-bit session IDs are preferred at extreme session counts
+- Nonce prefix is 4 bytes (32 bits), derived from the session key via HKDF; prefix collision probability is negligible within a single session's key lifetime
+- FIN / FIN_ACK are unauthenticated (an injected FIN causes session teardown; equivalent DoS risk to packet-dropping which is also undefendable)
 - **Not audited** — cryptographic usage has not been reviewed by a third party
 
 ---

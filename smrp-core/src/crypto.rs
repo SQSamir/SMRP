@@ -213,11 +213,25 @@ pub fn ed25519_verify(
         .map_err(|_| SmrpError::AuthenticationFailure)
 }
 
-/// Builds the 12-byte ChaCha20-Poly1305 nonce: `session_id[0..4] || seq (8 bytes BE)`.
+/// Derives a 4-byte nonce prefix from `ikm` via HKDF-SHA-256.
+///
+/// Domain-separated by `info`; used to build per-direction, per-domain
+/// ChaCha20-Poly1305 nonces that are independent of client-controlled input.
+///
+/// # Errors
+/// Returns [`SmrpError::InternalError`] on failure.
+pub fn derive_nonce_prefix(ikm: &[u8; 32], info: &[u8]) -> Result<[u8; 4], SmrpError> {
+    let full = hkdf_sha256(ikm, &[], info)?;
+    let mut out = [0u8; 4];
+    out.copy_from_slice(&full[..4]);
+    Ok(out)
+}
+
+/// Builds the 12-byte ChaCha20-Poly1305 nonce: `prefix[4] || seq (8 bytes BE)`.
 #[must_use]
-pub fn packet_nonce(session_id: &[u8; 8], seq: u64) -> [u8; 12] {
+pub fn make_nonce(prefix: &[u8; 4], seq: u64) -> [u8; 12] {
     let mut nonce = [0u8; 12];
-    nonce[0..4].copy_from_slice(&session_id[0..4]);
+    nonce[0..4].copy_from_slice(prefix);
     nonce[4..12].copy_from_slice(&seq.to_be_bytes());
     nonce
 }
