@@ -85,7 +85,7 @@ impl Default for SmrpConfig {
             hello_rate_limit:         10,
             max_sessions:             100_000,
             connect_timeout:          Duration::from_secs(10),
-            recv_timeout:             Duration::from_secs(60),
+            recv_timeout:             Duration::from_mins(1),
             fin_ack_timeout:          Duration::from_secs(5),
             session_channel_capacity: 256,
             accept_queue_capacity:    64,
