@@ -46,7 +46,7 @@ use crate::{
     transport,
 };
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -153,6 +153,43 @@ struct RetransmitState {
     ssthresh: usize,
     /// ACK counter for the congestion-avoidance phase (add 1/cwnd per ACK).
     ca_acks: usize,
+    /// Sequences the peer has selectively acknowledged; skip on retransmit.
+    sacked: BTreeSet<u64>,
+    /// Peer's advertised receive window in packets (from `recv_window` header field).
+    peer_recv_window: u16,
+}
+
+/// Reassembly buffer for a single fragmented message.
+struct FragmentAssembly {
+    pieces: Vec<Option<Vec<u8>>>,
+    received: u8,
+}
+
+impl FragmentAssembly {
+    fn new(frag_count: u8) -> Self {
+        Self {
+            pieces: vec![None; frag_count as usize],
+            received: 0,
+        }
+    }
+
+    /// Inserts a fragment; returns `true` when all pieces have arrived.
+    fn insert(&mut self, index: u8, data: Vec<u8>) -> bool {
+        let slot = &mut self.pieces[index as usize];
+        if slot.is_none() {
+            *slot = Some(data);
+            self.received += 1;
+        }
+        self.received as usize == self.pieces.len()
+    }
+
+    /// Concatenates all pieces in order into a single message.
+    fn assemble(self) -> Vec<u8> {
+        self.pieces
+            .into_iter()
+            .flat_map(std::option::Option::unwrap_or_default)
+            .collect()
+    }
 }
 
 type RetransmitBuf = Arc<tokio::sync::Mutex<RetransmitState>>;
@@ -177,8 +214,8 @@ pub struct SmrpConnection {
     recv_replay: ReplayWindow,
     /// Highest in-order sequence number delivered to the application.
     recv_seq: u64,
-    /// Out-of-order received plaintext waiting for earlier sequence numbers.
-    recv_buf: BTreeMap<u64, Vec<u8>>,
+    /// Out-of-order received packets (header + plaintext) waiting for earlier seq numbers.
+    recv_buf: BTreeMap<u64, (SmrpHeader, Vec<u8>)>,
     /// Next sequence number to deliver to the caller (1-based).
     next_deliver_seq: u64,
     /// Decrypted, consecutive packets ready for the caller to receive.
@@ -212,6 +249,12 @@ pub struct SmrpConnection {
 
     /// Timestamp (µs) of the last `KEEPALIVE_ACK` sent; limits replies to 1/second.
     last_keepalive_ack_us: u64,
+
+    // --- Fragmentation ---
+    /// Counter incremented each time `send()` fragments a large message.
+    frag_send_id: u16,
+    /// Partial reassembly state for fragmented messages keyed by `frag_id`.
+    reassembly: HashMap<u16, FragmentAssembly>,
 
     // --- Key update ---
     /// Local signing key used to authenticate `KEY_UPDATE` payloads.
@@ -406,6 +449,8 @@ impl SmrpConnection {
             cwnd: cfg.initial_cwnd,
             ssthresh: cfg.initial_ssthresh,
             ca_acks: 0,
+            sacked: BTreeSet::new(),
+            peer_recv_window: u16::MAX,
         }));
 
         spawn_keepalive_task(
@@ -462,6 +507,8 @@ impl SmrpConnection {
             ctrl_recv_nonce_prefix: session.ctrl_recv_nonce_prefix,
             ctrl_send_seq: 0,
             last_keepalive_ack_us: 0,
+            frag_send_id: 0,
+            reassembly: HashMap::new(),
             sign_key,
             peer_sign_pub,
             rekey_counter: 0,
@@ -476,31 +523,61 @@ impl SmrpConnection {
 
     // --- Public API ---
 
-    /// Encrypts `data` and sends it as a DATA packet.
+    /// Encrypts `data` and sends it, fragmenting transparently if needed.
     ///
-    /// Blocks when the congestion window is full (AIMD slow-start /
-    /// congestion-avoidance) and resumes automatically as ACKs arrive.
-    /// The packet is kept in a retransmit buffer until `ACKed`; it is
-    /// retransmitted up to `cfg.max_retransmits` times before the session
-    /// is declared dead.
+    /// Messages up to `MAX_PAYLOAD` are sent as a single DATA packet.
+    /// Larger messages are split into up to 255 fragments of ≤ `MAX_PAYLOAD`
+    /// bytes each, each carrying the `FRAGMENT` flag, a shared `frag_id`,
+    /// `frag_index`, and `frag_count`. The receiver reassembles them before
+    /// delivering to the application.
+    ///
+    /// Blocks when the effective send window (`min(cwnd, peer_recv_window)`) is
+    /// full and resumes automatically as ACKs / `SackAck`s arrive.
+    /// Each fragment is retransmitted up to `cfg.max_retransmits` times before
+    /// the session is declared dead.
     ///
     /// # Errors
-    /// Returns [`SmrpError::PayloadTooLarge`] if `data.len() > MAX_PAYLOAD`.
+    /// Returns [`SmrpError::PayloadTooLarge`] if the message requires more than
+    /// 255 fragments (i.e. `data.len() > 255 * MAX_PAYLOAD`).
     pub async fn send(&mut self, data: &[u8]) -> Result<(), SmrpError> {
-        if data.len() > MAX_PAYLOAD {
+        let max_fragments: usize = 255;
+        if data.len() > max_fragments * MAX_PAYLOAD {
             return Err(SmrpError::PayloadTooLarge);
         }
 
-        // Congestion-window backpressure.
-        // Register notified() *before* the capacity check to avoid a
-        // lost-wake race: if an ACK arrives between the check and the
-        // await, the notification is still captured.
+        if data.len() <= MAX_PAYLOAD {
+            self.send_fragment(data, None).await
+        } else {
+            let chunks: Vec<&[u8]> = data.chunks(MAX_PAYLOAD).collect();
+            let frag_count = chunks.len() as u8;
+            let frag_id = self.frag_send_id;
+            self.frag_send_id = self.frag_send_id.wrapping_add(1);
+            let total_len = data.len() as u64;
+            for (i, chunk) in chunks.into_iter().enumerate() {
+                self.send_fragment(chunk, Some((frag_id, i as u8, frag_count)))
+                    .await?;
+            }
+            self.metrics.bytes_sent.fetch_add(total_len, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    /// Sends a single DATA fragment (or a non-fragmented message).
+    /// `frag_info`: `Some((frag_id, frag_index, frag_count))` for fragments,
+    /// `None` for unfragmented messages.
+    async fn send_fragment(
+        &mut self,
+        data: &[u8],
+        frag_info: Option<(u16, u8, u8)>,
+    ) -> Result<(), SmrpError> {
+        // Congestion + flow-control backpressure.
         let notify = Arc::clone(&self.window_notify);
         loop {
             let notified = notify.notified();
             {
                 let state = self.retransmit_buf.lock().await;
-                if state.pending.len() < state.cwnd {
+                let effective_window = state.cwnd.min(state.peer_recv_window as usize);
+                if state.pending.len() < effective_window {
                     break;
                 }
             }
@@ -510,30 +587,39 @@ impl SmrpConnection {
         let seq = self.send_seq;
         let nonce = make_nonce(&self.data_send_nonce_prefix, seq);
 
-        // Build the header first so payload_len is known before sealing.
+        let (flags, frag_id, frag_index, frag_count) = match frag_info {
+            Some((id, idx, cnt)) => {
+                let mut f = Flags::default();
+                f.0 |= Flags::FRAGMENT;
+                (f, id, idx, cnt)
+            }
+            None => (Flags::default(), 0, 0, 0),
+        };
+
         let payload_len = (data.len() + AUTH_TAG_LEN) as u16;
         let hdr = SmrpHeader {
             magic: SMRP_MAGIC,
             version: SMRP_VERSION,
             packet_type: PacketType::Data,
-            flags: Flags::default(),
+            flags,
             reserved: 0,
             session_id: self.session_id,
             sequence_number: seq,
             ack_number: self.recv_seq,
             timestamp_us: timestamp_us(),
             payload_len,
+            frag_id,
+            frag_index,
+            frag_count,
+            recv_window: self.advertised_recv_window(),
         };
 
-        // Full 54-byte header as AAD; timestamp_us zeroed so retransmits
-        // (which refresh the timestamp) still pass authentication on the peer.
         let aad = data_aad(&hdr);
         let ciphertext = self.send_key.seal(&nonce, &aad, data)?;
 
         transport::send_raw(&self.socket, self.peer_addr, &hdr, &ciphertext).await?;
         self.send_seq += 1;
 
-        // Register in retransmit buffer — cleared when ACK(ack_number=seq) arrives.
         self.retransmit_buf.lock().await.pending.insert(
             seq,
             RetransmitEntry {
@@ -544,10 +630,16 @@ impl SmrpConnection {
             },
         );
 
-        self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-        self.metrics
-            .bytes_sent
-            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        // Only count bytes for unfragmented messages here; fragmented totals
+        // are counted in send() to avoid double-counting per-fragment.
+        if frag_info.is_none() {
+            self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .bytes_sent
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
+        } else {
+            self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -604,14 +696,12 @@ impl SmrpConnection {
 
                             if self.recv_replay.can_accept(seq).is_err() {
                                 self.metrics.replay_detections.fetch_add(1, Ordering::Relaxed);
-                                // Likely a retransmit: peer didn't receive our ACK.
-                                // Send a courtesy ACK so the peer stops retransmitting.
-                                let _ = self.send_ack(seq).await;
+                                // Likely a retransmit; re-send the current cumulative ACK.
+                                let _ = self.send_ack(self.recv_seq).await;
                                 continue;
                             }
 
                             let nonce = make_nonce(&self.data_recv_nonce_prefix, seq);
-                            // AAD mirrors the sender: full header with timestamp_us zeroed.
                             let aad = data_aad(&hdr);
 
                             let plaintext = self.recv_key.open(&nonce, &aad, &payload)
@@ -620,63 +710,82 @@ impl SmrpConnection {
                                 })?;
 
                             self.recv_replay.mark_seen(seq);
-                            // Always ACK immediately so the sender clears its retransmit buffer,
-                            // regardless of whether we can deliver yet (reorder buffering).
-                            let _ = self.send_ack(seq).await;
 
-                            // Buffer the packet; drop it if the reorder buffer is full.
                             if self.recv_buf.len() < self.recv_buf_limit {
-                                self.recv_buf.insert(seq, plaintext);
+                                self.recv_buf.insert(seq, (hdr, plaintext));
                             }
 
-                            // Drain all consecutive packets starting from next_deliver_seq
-                            // into the delivery queue.
-                            while let Some(data) = self.recv_buf.remove(&self.next_deliver_seq) {
+                            // Drain consecutive packets; keep the mut borrow on self short.
+                            while let Some((pkt_hdr, raw)) = self.recv_buf.remove(&self.next_deliver_seq) {
                                 self.recv_seq = self.next_deliver_seq;
                                 self.next_deliver_seq += 1;
                                 self.metrics.packets_received.fetch_add(1, Ordering::Relaxed);
-                                self.metrics.bytes_received.fetch_add(data.len() as u64, Ordering::Relaxed);
-                                self.deliver_queue.push_back(data);
+
+                                if pkt_hdr.flags.fragment() {
+                                    let frag_complete = {
+                                        let entry = self.reassembly
+                                            .entry(pkt_hdr.frag_id)
+                                            .or_insert_with(|| FragmentAssembly::new(pkt_hdr.frag_count));
+                                        entry.insert(pkt_hdr.frag_index, raw)
+                                    };
+                                    if frag_complete {
+                                        let assembled = self.reassembly
+                                            .remove(&pkt_hdr.frag_id)
+                                            .unwrap()
+                                            .assemble();
+                                        self.metrics.bytes_received
+                                            .fetch_add(assembled.len() as u64, Ordering::Relaxed);
+                                        self.deliver_queue.push_back(assembled);
+                                    }
+                                } else {
+                                    self.metrics.bytes_received
+                                        .fetch_add(raw.len() as u64, Ordering::Relaxed);
+                                    self.deliver_queue.push_back(raw);
+                                }
                             }
-                            // Loop back to pop from deliver_queue (fast path at top of loop).
+
+                            // ACK after drain so ack_number = current recv_seq.
+                            if self.recv_buf.is_empty() {
+                                let _ = self.send_ack(self.recv_seq).await;
+                            } else {
+                                let _ = self.send_sack().await;
+                            }
                         }
 
                         PacketType::Ack => {
-                            if self.verify_ctrl_mac(&hdr, &payload).is_err() { continue; }
-                            // Remove the ACKed packet from the retransmit buffer.
-                            // Karn's algorithm: only update RTT for first-send packets.
-                            let ack_n = hdr.ack_number;
-                            let mut buf = self.retransmit_buf.lock().await;
-                            if let Some(entry) = buf.pending.remove(&ack_n) {
-                                if entry.retries == 0 {
-                                    #[allow(clippy::cast_possible_truncation)]
-                                    buf.rtt.update(entry.sent_at.elapsed().as_micros() as u64);
-                                }
-                                // AIMD congestion window update.
-                                if buf.cwnd < buf.ssthresh {
-                                    buf.cwnd = buf.cwnd.saturating_add(1); // slow start
-                                } else {
-                                    // Congestion avoidance: +1 per full window of ACKs.
-                                    buf.ca_acks = buf.ca_acks.saturating_add(1);
-                                    if buf.ca_acks >= buf.cwnd {
-                                        buf.cwnd = buf.cwnd.saturating_add(1);
-                                        buf.ca_acks = 0;
+                            if self.open_ctrl_payload(&hdr, &payload).is_err() { continue; }
+                            self.retransmit_buf.lock().await.peer_recv_window = hdr.recv_window;
+                            self.process_cumulative_ack(hdr.ack_number).await;
+                        }
+
+                        PacketType::SackAck => {
+                            let Ok(sack_data) = self.open_ctrl_payload(&hdr, &payload) else {
+                                continue;
+                            };
+                            let cum_ack = hdr.ack_number;
+                            {
+                                let mut buf = self.retransmit_buf.lock().await;
+                                buf.peer_recv_window = hdr.recv_window;
+                                let blocks = parse_sack_blocks(&sack_data);
+                                for (start, end) in blocks {
+                                    for seq in start..=end {
+                                        buf.sacked.insert(seq);
                                     }
                                 }
-                                drop(buf);
-                                self.window_notify.notify_one();
+                                buf.sacked.retain(|&s| s > cum_ack);
                             }
+                            self.process_cumulative_ack(cum_ack).await;
                         }
 
                         PacketType::Fin => {
-                            if self.verify_ctrl_mac(&hdr, &payload).is_err() { continue; }
+                            if self.open_ctrl_payload(&hdr, &payload).is_err() { continue; }
                             let _ = self.send_fin_ack(hdr.sequence_number).await;
                             self.mark_closed();
                             return Ok(None);
                         }
 
                         PacketType::Reset => {
-                            if self.verify_ctrl_mac(&hdr, &payload).is_err() { continue; }
+                            if self.open_ctrl_payload(&hdr, &payload).is_err() { continue; }
                             self.mark_closed();
                             return Ok(None);
                         }
@@ -690,11 +799,11 @@ impl SmrpConnection {
                         }
 
                         PacketType::Ping => {
-                            if self.verify_ctrl_mac(&hdr, &payload).is_err() { continue; }
+                            if self.open_ctrl_payload(&hdr, &payload).is_err() { continue; }
                             let _ = self.send_pong(hdr.sequence_number, hdr.timestamp_us).await;
                         }
                         PacketType::Pong => {
-                            if self.verify_ctrl_mac(&hdr, &payload).is_err() { continue; }
+                            if self.open_ctrl_payload(&hdr, &payload).is_err() { continue; }
                             // RTT from the echoed timestamp_us carried in the PONG.
                             let rtt_us = timestamp_us().saturating_sub(hdr.timestamp_us);
                             if rtt_us > 0 && rtt_us < 60_000_000 {
@@ -753,6 +862,8 @@ impl SmrpConnection {
             ack_number: self.recv_seq,
             timestamp_us: timestamp_us(),
             payload_len: payload.len() as u16,
+            frag_id: 0, frag_index: 0, frag_count: 0,
+            recv_window: self.advertised_recv_window(),
         };
         transport::send_raw(&self.socket, self.peer_addr, &hdr, &payload).await?;
         self.pending_rekey = Some(eph);
@@ -793,25 +904,11 @@ impl SmrpConnection {
         self.ctrl_send_seq += 1;
         hdr.sequence_number = ctrl_seq;
         hdr.payload_len = AUTH_TAG_LEN as u16;
+        hdr.recv_window = self.advertised_recv_window();
         let aad = serialize_hdr(&hdr);
         let nonce = make_nonce(&self.ctrl_send_nonce_prefix, ctrl_seq);
         let tag = self.send_key.seal(&nonce, &aad, &[])?;
         transport::send_raw(&self.socket, self.peer_addr, &hdr, &tag).await
-    }
-
-    /// Verifies the 16-byte Poly1305 MAC on an incoming authenticated control packet.
-    fn verify_ctrl_mac(&self, hdr: &SmrpHeader, tag: &[u8]) -> Result<(), SmrpError> {
-        if tag.len() < AUTH_TAG_LEN {
-            return Err(SmrpError::MalformedHeader);
-        }
-        let nonce = make_nonce(&self.ctrl_recv_nonce_prefix, hdr.sequence_number);
-        let aad = serialize_hdr(hdr);
-        self.recv_key
-            .open(&nonce, &aad, &tag[..AUTH_TAG_LEN])
-            .inspect_err(|_| {
-                self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
-            })
-            .map(|_| ())
     }
 
     async fn send_fin_flag(&mut self) -> Result<(), SmrpError> {
@@ -824,10 +921,11 @@ impl SmrpConnection {
             flags,
             reserved: 0,
             session_id: self.session_id,
-            sequence_number: 0, // overwritten by send_ctrl_authenticated
+            sequence_number: 0,
             ack_number: self.recv_seq,
             timestamp_us: timestamp_us(),
             payload_len: 0,
+            frag_id: 0, frag_index: 0, frag_count: 0, recv_window: 0,
         })
         .await
     }
@@ -840,10 +938,11 @@ impl SmrpConnection {
             flags: Flags::default(),
             reserved: 0,
             session_id: self.session_id,
-            sequence_number: 0, // overwritten by send_ctrl_authenticated
+            sequence_number: 0,
             ack_number: ack_seq,
             timestamp_us: timestamp_us(),
             payload_len: 0,
+            frag_id: 0, frag_index: 0, frag_count: 0, recv_window: 0,
         })
         .await
     }
@@ -856,10 +955,11 @@ impl SmrpConnection {
             flags: Flags::default(),
             reserved: 0,
             session_id: self.session_id,
-            sequence_number: 0, // overwritten by send_ctrl_authenticated
+            sequence_number: 0,
             ack_number: ack_seq,
             timestamp_us: timestamp_us(),
             payload_len: 0,
+            frag_id: 0, frag_index: 0, frag_count: 0, recv_window: 0,
         })
         .await
     }
@@ -876,6 +976,7 @@ impl SmrpConnection {
             ack_number: self.recv_seq,
             timestamp_us: timestamp_us(),
             payload_len: 0,
+            frag_id: 0, frag_index: 0, frag_count: 0, recv_window: 0,
         })
         .await
     }
@@ -891,12 +992,142 @@ impl SmrpConnection {
             flags: Flags::default(),
             reserved: 0,
             session_id: self.session_id,
-            sequence_number: 0, // overwritten
+            sequence_number: 0,
             ack_number: ping_seq,
-            timestamp_us: ping_ts, // echoed for RTT computation
+            timestamp_us: ping_ts,
             payload_len: 0,
+            frag_id: 0, frag_index: 0, frag_count: 0, recv_window: 0,
         })
         .await
+    }
+
+    /// Decrypts and authenticates a control-packet payload using the recv ctrl key.
+    ///
+    /// For auth-only packets (Fin, Ack, Ping, …) the payload is just the 16-byte
+    /// Poly1305 tag; `open` returns empty bytes. For `SackAck` the payload is
+    /// sack-block data + tag; `open` returns the block data.
+    fn open_ctrl_payload(&self, hdr: &SmrpHeader, payload: &[u8]) -> Result<Vec<u8>, SmrpError> {
+        if payload.len() < AUTH_TAG_LEN {
+            return Err(SmrpError::MalformedHeader);
+        }
+        let nonce = make_nonce(&self.ctrl_recv_nonce_prefix, hdr.sequence_number);
+        let aad = serialize_hdr(hdr);
+        self.recv_key
+            .open(&nonce, &aad, payload)
+            .inspect_err(|_| {
+                self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+            })
+    }
+
+    /// Removes all retransmit-pending entries with seq ≤ `ack_n` (cumulative ACK).
+    async fn process_cumulative_ack(&mut self, ack_n: u64) {
+        if ack_n == 0 {
+            return;
+        }
+        let mut buf = self.retransmit_buf.lock().await;
+        // Collect keys to remove; BTreeMap iterates in sorted order.
+        let to_remove: Vec<u64> = buf.pending.range(..=ack_n).map(|(&k, _)| k).collect();
+        let mut any_removed = false;
+        for seq in to_remove {
+            if let Some(entry) = buf.pending.remove(&seq) {
+                if entry.retries == 0 {
+                    #[allow(clippy::cast_possible_truncation)]
+                    buf.rtt.update(entry.sent_at.elapsed().as_micros() as u64);
+                }
+                any_removed = true;
+            }
+        }
+        // Clear sacked entries that the cumulative ACK has now covered.
+        buf.sacked.retain(|&s| s > ack_n);
+
+        if any_removed {
+            // AIMD: one window-open event per ACK batch.
+            if buf.cwnd < buf.ssthresh {
+                buf.cwnd = buf.cwnd.saturating_add(1);
+            } else {
+                buf.ca_acks = buf.ca_acks.saturating_add(1);
+                if buf.ca_acks >= buf.cwnd {
+                    buf.cwnd = buf.cwnd.saturating_add(1);
+                    buf.ca_acks = 0;
+                }
+            }
+            drop(buf);
+            self.window_notify.notify_one();
+        }
+    }
+
+    /// Builds and sends a `SackAck` with the current cumulative `recv_seq` and
+    /// SACK blocks derived from the out-of-order `recv_buf`.
+    async fn send_sack(&mut self) -> Result<(), SmrpError> {
+        let blocks = self.build_sack_blocks();
+        let mut sack_data: Vec<u8> = Vec::with_capacity(blocks.len() * 16);
+        for (start, end) in &blocks {
+            sack_data.extend_from_slice(&start.to_be_bytes());
+            sack_data.extend_from_slice(&end.to_be_bytes());
+        }
+
+        let ctrl_seq = self.ctrl_send_seq;
+        self.ctrl_send_seq += 1;
+        let payload_len = (sack_data.len() + AUTH_TAG_LEN) as u16;
+        let hdr = SmrpHeader {
+            magic: SMRP_MAGIC,
+            version: SMRP_VERSION,
+            packet_type: PacketType::SackAck,
+            flags: Flags::default(),
+            reserved: 0,
+            session_id: self.session_id,
+            sequence_number: ctrl_seq,
+            ack_number: self.recv_seq,
+            timestamp_us: timestamp_us(),
+            payload_len,
+            frag_id: 0,
+            frag_index: 0,
+            frag_count: 0,
+            recv_window: self.advertised_recv_window(),
+        };
+        let nonce = make_nonce(&self.ctrl_send_nonce_prefix, ctrl_seq);
+        let aad = serialize_hdr(&hdr);
+        let ciphertext = self.send_key.seal(&nonce, &aad, &sack_data)?;
+        transport::send_raw(&self.socket, self.peer_addr, &hdr, &ciphertext).await
+    }
+
+    /// Compacts `recv_buf` keys into contiguous `(start, end)` ranges for SACK.
+    fn build_sack_blocks(&self) -> Vec<(u64, u64)> {
+        let mut blocks: Vec<(u64, u64)> = Vec::new();
+        let max = self.cfg.max_sack_blocks;
+        let mut range: Option<(u64, u64)> = None;
+        for &seq in self.recv_buf.keys() {
+            if blocks.len() >= max {
+                break;
+            }
+            match range {
+                None => range = Some((seq, seq)),
+                Some((s, e)) if seq == e + 1 => range = Some((s, seq)),
+                Some(r) => {
+                    blocks.push(r);
+                    if blocks.len() < max {
+                        range = Some((seq, seq));
+                    } else {
+                        range = None;
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(r) = range {
+            if blocks.len() < max {
+                blocks.push(r);
+            }
+        }
+        blocks
+    }
+
+    /// Returns the number of free slots in `recv_buf` as the advertised window.
+    #[allow(clippy::cast_possible_truncation)]
+    fn advertised_recv_window(&self) -> u16 {
+        self.recv_buf_limit
+            .saturating_sub(self.recv_buf.len())
+            .min(u16::MAX as usize) as u16
     }
 
     async fn wait_fin_ack(&mut self) {
@@ -908,7 +1139,8 @@ impl SmrpConnection {
                 SessionMsg::Shutdown => return,
                 SessionMsg::Packet(h, p) => (h, p),
             };
-            if hdr.packet_type == PacketType::FinAck && self.verify_ctrl_mac(&hdr, &payload).is_ok()
+            if hdr.packet_type == PacketType::FinAck
+                && self.open_ctrl_payload(&hdr, &payload).is_ok()
             {
                 return;
             }
@@ -997,6 +1229,8 @@ impl SmrpConnection {
             ack_number: self.recv_seq,
             timestamp_us: timestamp_us(),
             payload_len: ack_payload.len() as u16,
+            frag_id: 0, frag_index: 0, frag_count: 0,
+            recv_window: self.advertised_recv_window(),
         };
         if let Err(e) =
             transport::send_raw(&self.socket, self.peer_addr, &ack_hdr, &ack_payload).await
@@ -1126,6 +1360,7 @@ fn spawn_keepalive_task(
                         packet_type: PacketType::Keepalive, flags: Flags::default(), reserved: 0,
                         session_id, sequence_number: 0, ack_number: 0,
                         timestamp_us: timestamp_us(), payload_len: 0,
+                        frag_id: 0, frag_index: 0, frag_count: 0, recv_window: 0,
                     };
                     if transport::send_raw(&socket, peer_addr, &hdr, &[]).await.is_err() {
                         break;
@@ -1171,6 +1406,7 @@ fn spawn_retransmit_task(
                     let mut dead = false;
 
                     for (&seq, entry) in &state.pending {
+                        if state.sacked.contains(&seq) { continue; } // peer has it
                         if now.duration_since(entry.sent_at) < rto { continue; }
                         if entry.retries >= max_retransmits {
                             warn!("session {session_id:?}: max retransmits ({max_retransmits}) for seq={seq} — session dead");
@@ -1302,6 +1538,22 @@ fn derive_rekey_keys(
     let c2s = hkdf_sha256(shared, &salt, b"smrp-v1-rekey-c2s")?;
     let s2c = hkdf_sha256(shared, &salt, b"smrp-v1-rekey-s2c")?;
     Ok((c2s, s2c))
+}
+
+/// Decodes a SACK payload into `(start, end)` inclusive sequence-number ranges.
+/// Each block is 16 bytes: `start_be8 || end_be8`. Truncates at byte boundary.
+fn parse_sack_blocks(data: &[u8]) -> Vec<(u64, u64)> {
+    let mut blocks = Vec::new();
+    let mut i = 0;
+    while i + 16 <= data.len() {
+        let mut s = [0u8; 8];
+        let mut e = [0u8; 8];
+        s.copy_from_slice(&data[i..i + 8]);
+        e.copy_from_slice(&data[i + 8..i + 16]);
+        blocks.push((u64::from_be_bytes(s), u64::from_be_bytes(e)));
+        i += 16;
+    }
+    blocks
 }
 
 // ---------------------------------------------------------------------------
@@ -1590,7 +1842,8 @@ async fn listener_dispatch(
                     }
 
                     PacketType::Data | PacketType::Fin | PacketType::FinAck
-                    | PacketType::Ack | PacketType::Keepalive | PacketType::KeepaliveAck
+                    | PacketType::Ack | PacketType::SackAck
+                    | PacketType::Keepalive | PacketType::KeepaliveAck
                     | PacketType::Reset | PacketType::Ping | PacketType::Pong
                     | PacketType::KeyUpdate | PacketType::KeyUpdateAck => {
                         let mut map = sessions.lock().await;
@@ -1644,6 +1897,7 @@ async fn send_error_reply(
         ack_number: 0,
         timestamp_us: timestamp_us(),
         payload_len: 1,
+        frag_id: 0, frag_index: 0, frag_count: 0, recv_window: 0,
     };
     let _ = transport::send_raw(socket, addr, &hdr, &[err.wire_code()]).await;
 }
@@ -1727,12 +1981,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_payload_rejected_locally() {
+    async fn fragmented_payload_roundtrip() {
+        // MAX_PAYLOAD + 1 requires 2 fragments; the echo server reassembles and
+        // re-sends it back as a single send(), which also fragments on the way back.
         let (addr, listener) = echo_server().await;
         spawn_echo(listener);
         let mut conn = SmrpConnection::connect(&addr.to_string()).await.unwrap();
+        let data = vec![0x42u8; MAX_PAYLOAD + 1];
+        conn.send(&data).await.unwrap();
+        let reply = conn.recv().await.unwrap().unwrap();
+        assert_eq!(reply, data);
+        conn.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn too_many_fragments_rejected_locally() {
+        let (addr, listener) = echo_server().await;
+        spawn_echo(listener);
+        let mut conn = SmrpConnection::connect(&addr.to_string()).await.unwrap();
+        // 255 * MAX_PAYLOAD + 1 exceeds the 255-fragment limit.
+        let huge = vec![0u8; 255 * MAX_PAYLOAD + 1];
         assert_eq!(
-            conn.send(&vec![0u8; MAX_PAYLOAD + 1]).await.unwrap_err(),
+            conn.send(&huge).await.unwrap_err(),
             SmrpError::PayloadTooLarge
         );
         conn.close().await.unwrap();

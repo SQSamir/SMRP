@@ -76,6 +76,11 @@ pub struct SmrpConfig {
     /// Packets that would exceed this limit are dropped (and retransmitted by
     /// the peer). Default: 256.
     pub recv_buf_limit: usize,
+
+    // ---- SACK ---------------------------------------------------------------
+    /// Maximum number of SACK blocks included in a single `SackAck` packet.
+    /// Each block is 16 bytes (two u64 sequence numbers). Default: 16.
+    pub max_sack_blocks: usize,
 }
 
 impl Default for SmrpConfig {
@@ -98,6 +103,7 @@ impl Default for SmrpConfig {
             initial_cwnd: 4,
             initial_ssthresh: 64,
             recv_buf_limit: 256,
+            max_sack_blocks: 16,
         }
     }
 }

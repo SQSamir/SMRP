@@ -175,6 +175,10 @@ fn make_header(
         ack_number: ack,
         timestamp_us: packet::timestamp_us(),
         payload_len: payload_len as u16,
+        frag_id: 0,
+        frag_index: 0,
+        frag_count: 0,
+        recv_window: 0,
     }
 }
 
