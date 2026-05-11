@@ -1,9 +1,21 @@
 # SMRP Protocol Specification
 
-**Version:** 0.7  
+**Version:** 0.8  
 **Status:** Draft  
 **Authors:** Samir Gasimov
 
+> **Changelog v0.7→v0.8 (non-wire-breaking):**
+> Bug fix: `handle_key_update` (responder) now performs X25519 `agree()` and
+> derives new keys *before* transmitting `KEY_UPDATE_ACK` — previously the ACK
+> was sent before `agree()`, so a failed DH would leave the initiator using new
+> keys while the responder retained old ones (silent session death).
+> `initial_ssthresh` added to `SmrpConfig` (default 64) making the slow-start
+> threshold configurable; `ssthresh` magic number eliminated from `conn.rs`.
+> Known Limitations updated: KEEPALIVE unauthenticated on receive; DATA received
+> during `request_key_update()` is silently discarded.
+> Test suite: 82→84 tests (`max_retransmits_kills_session`,
+> `initial_ssthresh_from_config`).
+>
 > **Changelog v0.6→v0.7 (wire-breaking; version byte 0x02):**
 > HKDF-derived nonce prefixes (§7.2) — `packet_nonce` replaced by four
 > per-direction, per-domain prefixes derived from session keys via HKDF; full
@@ -576,6 +588,7 @@ See §15.1 for the full API.
 | rto_min                 | 50 ms      | Minimum RTO (also retransmit-task interval)    |
 | rto_max                 | 30 s       | Maximum RTO (exponential backoff ceiling)      |
 | initial_cwnd            | 4 pkts     | Starting congestion window (see §8.6)          |
+| initial_ssthresh        | 64 pkts    | Slow-start threshold; above this, AIMD CA runs |
 | recv_buf_limit          | 256 pkts   | Max out-of-order packets in reorder buffer     |
 
 ---
@@ -625,11 +638,20 @@ Two-layer defence:
   recv cannot run concurrently on one connection (see §8.6 API constraint)
 - **KEY_UPDATE sequential constraint** — `request_key_update()` requires the
   retransmit buffer to be empty; in-flight packets at rekey time will cause
-  session death. Callers must drain pending ACKs before initiating a rekey.
-- **Nonce entropy** — the 12-byte nonce uses only 32 bits of session ID entropy;
-  within a session nonce uniqueness is guaranteed by the 64-bit sequence number,
-  but cross-session collision probability should be considered at very high
-  session counts
+  session death. Additionally, DATA packets received during the blocking wait
+  for `KEY_UPDATE_ACK` are silently discarded — callers must drain pending
+  ACKs and ensure no concurrent inbound DATA before initiating a rekey.
+- **KEEPALIVE unauthenticated on receive** — any host can send a spoofed
+  KEEPALIVE to reset the peer's dead-session timer and elicit a `KEEPALIVE_ACK`.
+  The risk is equivalent to packet-flooding (undefendable without a network-layer
+  allowlist) and is acceptable for a research protocol. KEEPALIVE_ACK is
+  authenticated (Poly1305 MAC) so injected fakes carry no credentials.
+- **FIN / FIN_ACK unauthenticated** — an injected FIN triggers session teardown;
+  the DoS risk is equivalent to packet-dropping (undefendable)
+- **Nonce entropy** — the 12-byte nonce uses a 32-bit HKDF-derived prefix; within
+  a session nonce uniqueness is guaranteed by the 64-bit sequence number, but the
+  32-bit prefix has negligible collision probability only within a single session's
+  key lifetime
 - **Not audited** — cryptographic usage has not been reviewed by a third party
 
 ---
@@ -655,6 +677,7 @@ pub struct SmrpConfig {
     pub rto_min:                  Duration,  // default: 50 ms
     pub rto_max:                  Duration,  // default: 30 s
     pub initial_cwnd:             usize,     // default: 4
+    pub initial_ssthresh:         usize,     // default: 64
     pub recv_buf_limit:           usize,     // default: 256
 }
 

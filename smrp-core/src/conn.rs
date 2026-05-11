@@ -403,7 +403,7 @@ impl SmrpConnection {
             pending: BTreeMap::new(),
             rtt: RttEstimator::new(cfg.rto_initial, cfg.rto_min, cfg.rto_max),
             cwnd: cfg.initial_cwnd,
-            ssthresh: 64,
+            ssthresh: cfg.initial_ssthresh,
             ca_acks: 0,
         }));
 
@@ -977,6 +977,18 @@ impl SmrpConnection {
         };
         let ack_payload =
             build_key_update_payload(&our_eph, &self.sign_key, self.session_id, counter);
+
+        // Perform DH agree BEFORE sending the ACK.
+        // If agree fails, we send nothing and the initiator will timeout —
+        // preventing the initiator from installing keys we cannot match.
+        let shared = match our_eph.agree(&peer_eph_pub) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("KEY_UPDATE X25519 agree failed: {e}");
+                return;
+            }
+        };
+
         let ack_hdr = SmrpHeader {
             magic: SMRP_MAGIC,
             version: SMRP_VERSION,
@@ -995,21 +1007,17 @@ impl SmrpConnection {
             warn!("KEY_UPDATE_ACK send failed: {e}");
             return;
         }
-        match our_eph.agree(&peer_eph_pub) {
-            Ok(shared) => match self.install_rekey_keys(&shared, counter) {
-                Ok(()) => {
-                    self.peer_rekey_counter = counter;
-                    debug!(
-                        "session {:?}: KEY_UPDATE complete (responder) counter={counter}",
-                        self.session_id
-                    );
-                }
-                Err(e) => {
-                    warn!("KEY_UPDATE key install failed: {e}");
-                }
-            },
+
+        match self.install_rekey_keys(&shared, counter) {
+            Ok(()) => {
+                self.peer_rekey_counter = counter;
+                debug!(
+                    "session {:?}: KEY_UPDATE complete (responder) counter={counter}",
+                    self.session_id
+                );
+            }
             Err(e) => {
-                warn!("KEY_UPDATE X25519 agree failed: {e}");
+                warn!("KEY_UPDATE key install failed: {e}");
             }
         }
     }
@@ -2019,6 +2027,68 @@ mod tests {
         assert_eq!(r0, &[0]);
         assert_eq!(r1, &[1]);
 
+        conn.close().await.unwrap();
+    }
+
+    // --- max_retransmits exceeded → session dead ---
+
+    #[tokio::test]
+    async fn max_retransmits_kills_session() {
+        // Server accepts but never calls recv(), so DATA packets are never
+        // ACKed. The client's retransmit task should declare the session dead
+        // after max_retransmits exhausted and return Ok(None) from recv().
+        let (addr, mut listener) = echo_server().await;
+
+        tokio::spawn(async move {
+            // Accept so the handshake completes, then hold the connection open
+            // without ever processing it (no recv() call → no ACKs sent).
+            let _conn = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let cfg = Arc::new(SmrpConfig {
+            max_retransmits: 3,
+            rto_initial: Duration::from_millis(20),
+            rto_min: Duration::from_millis(20),
+            rto_max: Duration::from_millis(100),
+            recv_timeout: Duration::from_secs(10),
+            ..SmrpConfig::default()
+        });
+        let mut conn = SmrpConnection::connect_with_config(&addr.to_string(), cfg)
+            .await
+            .unwrap();
+
+        conn.send(b"never acked").await.unwrap();
+
+        // The retransmit task fires dead_notify_tx after max_retransmits;
+        // recv_inner catches it and returns Ok(None).
+        let result = time::timeout(Duration::from_secs(5), conn.recv()).await;
+        assert!(result.is_ok(), "test itself timed out");
+        assert!(
+            result.unwrap().unwrap().is_none(),
+            "expected Ok(None) when session is declared dead"
+        );
+    }
+
+    // --- initial_ssthresh is configurable ---
+
+    #[tokio::test]
+    async fn initial_ssthresh_from_config() {
+        let cfg = Arc::new(SmrpConfig {
+            initial_ssthresh: 8,
+            ..SmrpConfig::default()
+        });
+        let (addr, listener) = echo_server().await;
+        spawn_echo(listener);
+        let conn = SmrpConnection::connect_with_config(&addr.to_string(), cfg)
+            .await
+            .unwrap();
+        let state = conn.retransmit_buf.lock().await;
+        assert_eq!(
+            state.ssthresh, 8,
+            "ssthresh should match initial_ssthresh in config"
+        );
+        drop(state);
         conn.close().await.unwrap();
     }
 }

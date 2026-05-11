@@ -62,9 +62,14 @@ pub struct SmrpConfig {
 
     // ---- Congestion control --------------------------------------------------
     /// Initial congestion window — maximum DATA packets in flight before the
-    /// first ACK arrives. Uses slow-start from this value up to `ssthresh`,
+    /// first ACK arrives. Uses slow-start from this value up to `initial_ssthresh`,
     /// then switches to AIMD congestion avoidance. Default: 4.
     pub initial_cwnd: usize,
+
+    /// Initial slow-start threshold. Slow-start runs while `cwnd < ssthresh`;
+    /// above this value the sender switches to AIMD congestion avoidance.
+    /// Default: 64.
+    pub initial_ssthresh: usize,
 
     // ---- Receive reorder buffer ---------------------------------------------
     /// Maximum out-of-order DATA packets held in the receive reorder buffer.
@@ -91,6 +96,7 @@ impl Default for SmrpConfig {
             rto_min: Duration::from_millis(50),
             rto_max: Duration::from_secs(30),
             initial_cwnd: 4,
+            initial_ssthresh: 64,
             recv_buf_limit: 256,
         }
     }

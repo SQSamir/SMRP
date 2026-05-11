@@ -22,7 +22,7 @@ a minimal, auditable implementation in safe Rust.
 - **RFC 6479 anti-replay window** — 128-packet sliding window, two-phase DoS-safe design
 - **Reliable delivery** — per-packet retransmit buffer; Jacobson/Karels RTT estimator; exponential backoff; Karn's algorithm
 - **Ordered delivery** — out-of-order DATA packets are buffered and delivered to the application in send order
-- **AIMD congestion control** — slow-start + AIMD congestion avoidance; `send()` backpressures when the congestion window is full
+- **AIMD congestion control** — slow-start + AIMD congestion avoidance; `send()` backpressures when the congestion window is full; `initial_ssthresh` configurable via `SmrpConfig`
 - **In-band key update** — `request_key_update()` rotates session keys mid-stream via X25519 + HKDF without a full re-handshake; Ed25519 identity pinning prevents impersonation
 - **HKDF-derived nonce prefixes** — four independent 4-byte prefixes (data-c2s/s2c, ctrl-c2s/s2c) eliminate client-controlled nonce input; full 54-byte header as DATA AEAD additional data
 - **Authenticated control packets** — ACK, KEEPALIVE_ACK, RESET, PING, PONG carry a 16-byte Poly1305 MAC tag; prevents injection of fake ACKs and RESETs
@@ -277,7 +277,7 @@ smrp/
 cargo test --workspace
 ```
 
-**82 tests** across all modules:
+**84 tests** across all modules:
 
 | Module      | Tests | Coverage                                                          |
 |-------------|-------|-------------------------------------------------------------------|
@@ -286,11 +286,12 @@ cargo test --workspace
 | `packet`    | 13    | Parse/serialize, all 14 packet types, flag bits                   |
 | `session`   | 3     | SessionId equality, state copy                                    |
 | `replay`    | 11    | In-order, replay, out-of-order, two-phase, window slide           |
-| `conn`      | 19    | Round-trip, concurrency, max payload, timeouts, FIN/FIN_ACK,      |
+| `conn`      | 21    | Round-trip, concurrency, max payload, timeouts, FIN/FIN_ACK,      |
 |             |       | metrics, custom config, shutdown, no-accept-after-shutdown,       |
 |             |       | retransmit-buffer drain, PKCS8 roundtrip, persistent key bind,    |
 |             |       | ordered delivery, congestion window backpressure, key rotation,   |
-|             |       | pinned-key accept, pinned-key reject                              |
+|             |       | pinned-key accept, pinned-key reject,                             |
+|             |       | max-retransmits session death, configurable ssthresh              |
 | `vectors`   | 23    | X25519 DH symmetry, HKDF determinism/domain-sep, nonce prefix     |
 |             |       | isolation, `make_nonce` layout, ChaCha20-Poly1305 seal/open/      |
 |             |       | tamper/wrong-AAD/wrong-nonce, Ed25519 sign/verify/tamper/pkcs8    |
@@ -345,8 +346,9 @@ cargo +nightly fuzz run fuzz_replay_window
 - No certificate infrastructure — signing keys distributed out-of-band or TOFU; no revocation
 - Basic congestion control only — no ECN, pacing, or bandwidth estimation; sequential `&mut self` API means send and recv cannot run concurrently on one connection
 - No fragmentation — payloads over 1 280 bytes must be split by the caller
-- Key update sequencing constraint — retransmit buffer must be empty before `request_key_update()`; in-flight packets at rekey time cause session death
+- Key update sequencing constraint — retransmit buffer must be empty before `request_key_update()`; additionally, DATA packets received during `request_key_update()` are discarded (the call blocks `recv_inner` while waiting for `KEY_UPDATE_ACK`)
 - Nonce prefix is 4 bytes (32 bits), derived from the session key via HKDF; prefix collision probability is negligible within a single session's key lifetime
+- KEEPALIVE probes are unauthenticated on the receive side — any host can reset the dead-session timer and elicit a `KEEPALIVE_ACK`; equivalent DoS risk to packet-flooding which is undefendable without a network-layer allowlist
 - FIN / FIN_ACK are unauthenticated (an injected FIN causes session teardown; equivalent DoS risk to packet-dropping which is also undefendable)
 - **Not audited** — cryptographic usage has not been reviewed by a third party
 
