@@ -1,5 +1,5 @@
 use crate::error::SmrpError;
-use ring::{aead, agreement, hkdf, rand, signature as ring_sig};
+use ring::{aead, agreement, digest, hkdf, rand, signature as ring_sig};
 use ring_sig::KeyPair as _;
 
 /// Fills `buf` with cryptographically secure random bytes.
@@ -235,6 +235,15 @@ pub fn derive_nonce_prefix(ikm: &[u8; 32], info: &[u8]) -> Result<[u8; 4], SmrpE
     let mut out = [0u8; 4];
     out.copy_from_slice(&full[..4]);
     Ok(out)
+}
+
+/// Returns the SHA-256 digest of `data`.
+#[must_use]
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    let d = digest::digest(&digest::SHA256, data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(d.as_ref());
+    out
 }
 
 /// Builds the 12-byte ChaCha20-Poly1305 nonce: `prefix[4] || seq (8 bytes BE)`.

@@ -76,8 +76,6 @@ enum SessionMsg {
 struct SessionEntry {
     /// Channel into the server-side `SmrpConnection`'s receive loop.
     data_tx: mpsc::Sender<SessionMsg>,
-    /// UDP address of the remote peer (needed to send FINs during shutdown).
-    peer_addr: SocketAddr,
 }
 
 type SessionMap = Arc<tokio::sync::Mutex<HashMap<SessionId, SessionEntry>>>;
@@ -211,6 +209,9 @@ pub struct SmrpConnection {
     ctrl_recv_nonce_prefix: [u8; 4],
     /// Monotonic counter for authenticated control-packet nonces.
     ctrl_send_seq: u64,
+
+    /// Timestamp (µs) of the last `KEEPALIVE_ACK` sent; limits replies to 1/second.
+    last_keepalive_ack_us: u64,
 
     // --- Key update ---
     /// Local signing key used to authenticate `KEY_UPDATE` payloads.
@@ -460,6 +461,7 @@ impl SmrpConnection {
             ctrl_send_nonce_prefix: session.ctrl_send_nonce_prefix,
             ctrl_recv_nonce_prefix: session.ctrl_recv_nonce_prefix,
             ctrl_send_seq: 0,
+            last_keepalive_ack_us: 0,
             sign_key,
             peer_sign_pub,
             rekey_counter: 0,
@@ -667,7 +669,7 @@ impl SmrpConnection {
                         }
 
                         PacketType::Fin => {
-                            // FIN is unauthenticated (listener shutdown sends without crypto state).
+                            if self.verify_ctrl_mac(&hdr, &payload).is_err() { continue; }
                             let _ = self.send_fin_ack(hdr.sequence_number).await;
                             self.mark_closed();
                             return Ok(None);
@@ -680,7 +682,11 @@ impl SmrpConnection {
                         }
 
                         PacketType::Keepalive => {
-                            let _ = self.send_keepalive_ack().await;
+                            let now_us = timestamp_us();
+                            if now_us.saturating_sub(self.last_keepalive_ack_us) >= 1_000_000 {
+                                let _ = self.send_keepalive_ack().await;
+                                self.last_keepalive_ack_us = now_us;
+                            }
                         }
 
                         PacketType::Ping => {
@@ -808,47 +814,37 @@ impl SmrpConnection {
             .map(|_| ())
     }
 
-    async fn send_fin_flag(&self) -> Result<(), SmrpError> {
+    async fn send_fin_flag(&mut self) -> Result<(), SmrpError> {
         let mut flags = Flags::default();
         flags.0 |= Flags::FIN;
-        transport::send_raw(
-            &self.socket,
-            self.peer_addr,
-            &SmrpHeader {
-                magic: SMRP_MAGIC,
-                version: SMRP_VERSION,
-                packet_type: PacketType::Fin,
-                flags,
-                reserved: 0,
-                session_id: self.session_id,
-                sequence_number: self.send_seq,
-                ack_number: self.recv_seq,
-                timestamp_us: timestamp_us(),
-                payload_len: 0,
-            },
-            &[],
-        )
+        self.send_ctrl_authenticated(SmrpHeader {
+            magic: SMRP_MAGIC,
+            version: SMRP_VERSION,
+            packet_type: PacketType::Fin,
+            flags,
+            reserved: 0,
+            session_id: self.session_id,
+            sequence_number: 0, // overwritten by send_ctrl_authenticated
+            ack_number: self.recv_seq,
+            timestamp_us: timestamp_us(),
+            payload_len: 0,
+        })
         .await
     }
 
-    async fn send_fin_ack(&self, ack_seq: u64) -> Result<(), SmrpError> {
-        transport::send_raw(
-            &self.socket,
-            self.peer_addr,
-            &SmrpHeader {
-                magic: SMRP_MAGIC,
-                version: SMRP_VERSION,
-                packet_type: PacketType::FinAck,
-                flags: Flags::default(),
-                reserved: 0,
-                session_id: self.session_id,
-                sequence_number: self.send_seq,
-                ack_number: ack_seq,
-                timestamp_us: timestamp_us(),
-                payload_len: 0,
-            },
-            &[],
-        )
+    async fn send_fin_ack(&mut self, ack_seq: u64) -> Result<(), SmrpError> {
+        self.send_ctrl_authenticated(SmrpHeader {
+            magic: SMRP_MAGIC,
+            version: SMRP_VERSION,
+            packet_type: PacketType::FinAck,
+            flags: Flags::default(),
+            reserved: 0,
+            session_id: self.session_id,
+            sequence_number: 0, // overwritten by send_ctrl_authenticated
+            ack_number: ack_seq,
+            timestamp_us: timestamp_us(),
+            payload_len: 0,
+        })
         .await
     }
 
@@ -908,11 +904,12 @@ impl SmrpConnection {
             let Some(msg) = self.data_rx.recv().await else {
                 return;
             };
-            let hdr = match msg {
+            let (hdr, payload) = match msg {
                 SessionMsg::Shutdown => return,
-                SessionMsg::Packet(h, _) => h,
+                SessionMsg::Packet(h, p) => (h, p),
             };
-            if hdr.packet_type == PacketType::FinAck {
+            if hdr.packet_type == PacketType::FinAck && self.verify_ctrl_mac(&hdr, &payload).is_ok()
+            {
                 return;
             }
         }
@@ -1314,12 +1311,9 @@ fn derive_rekey_keys(
 /// Listens for inbound SMRP connections on a UDP port.
 pub struct SmrpListener {
     local_addr: SocketAddr,
-    /// Shared with the dispatch task; needed by `shutdown()` to send FINs.
-    socket: Arc<UdpSocket>,
     new_conn_rx: mpsc::Receiver<SmrpConnection>,
     /// Drop or send on this to stop the dispatch loop.
     shutdown_tx: mpsc::Sender<()>,
-    /// Shared with the dispatch task; holds `peer_addr` per session for shutdown.
     sessions: SessionMap,
     cfg: Arc<SmrpConfig>,
     metrics: Arc<SmrpMetrics>,
@@ -1387,7 +1381,6 @@ impl SmrpListener {
 
         Ok(Self {
             local_addr,
-            socket,
             new_conn_rx,
             shutdown_tx,
             sessions,
@@ -1424,40 +1417,25 @@ impl SmrpListener {
     /// Gracefully shuts down the listener.
     ///
     /// 1. Signals the dispatch loop to stop (no new connections accepted).
-    /// 2. Sends a FIN UDP packet to every connected peer so their
-    ///    `recv()` returns `Ok(None)` promptly.
-    /// 3. Injects a `Shutdown` signal into every server-side session channel
-    ///    so server connections clean up when their `recv()` is next called.
-    /// 4. Dropping `self` closes `new_conn_rx`, causing `accept()` → `None`.
-    pub async fn shutdown(self) {
+    /// 2. Drains the accept queue: each unaccepted `SmrpConnection` is closed
+    ///    with an authenticated FIN so remote peers terminate promptly.
+    /// 3. Injects a `Shutdown` signal into every accepted session channel so
+    ///    their `recv_inner` sends an authenticated FIN and returns `Ok(None)`.
+    pub async fn shutdown(mut self) {
         drop(self.shutdown_tx);
 
+        // Close connections that were never accepted by the application.
+        while let Ok(conn) = self.new_conn_rx.try_recv() {
+            tokio::spawn(async move {
+                let _ = conn.close().await;
+            });
+        }
+
+        // Signal already-accepted sessions to close via their recv_inner loop.
         let map = self.sessions.lock().await;
-        for (sid, entry) in map.iter() {
-            // UDP FIN notifies the remote peer promptly (unauthenticated; FIN injection
-            // is a DoS-class risk comparable to packet dropping, which is undefendable).
-            let fin = shutdown_fin(*sid);
-            let _ = transport::send_raw(&self.socket, entry.peer_addr, &fin, &[]).await;
-            // Shutdown signal unblocks the server-side SmrpConnection::recv_inner.
+        for entry in map.values() {
             let _ = entry.data_tx.try_send(SessionMsg::Shutdown);
         }
-    }
-}
-
-fn shutdown_fin(session_id: SessionId) -> SmrpHeader {
-    let mut flags = Flags::default();
-    flags.0 |= Flags::FIN;
-    SmrpHeader {
-        magic: SMRP_MAGIC,
-        version: SMRP_VERSION,
-        packet_type: PacketType::Fin,
-        flags,
-        reserved: 0,
-        session_id,
-        sequence_number: 0,
-        ack_number: 0,
-        timestamp_us: timestamp_us(),
-        payload_len: 0,
     }
 }
 
@@ -1537,13 +1515,10 @@ fn spawn_hello_handler(
         metrics.sessions_active.fetch_add(1, Ordering::Relaxed);
         metrics.sessions_total.fetch_add(1, Ordering::Relaxed);
 
-        sessions.lock().await.insert(
-            conn_sid,
-            SessionEntry {
-                data_tx,
-                peer_addr: addr,
-            },
-        );
+        sessions
+            .lock()
+            .await
+            .insert(conn_sid, SessionEntry { data_tx });
 
         if new_conn_tx.send(conn).await.is_err() {
             sessions.lock().await.remove(&conn_sid);

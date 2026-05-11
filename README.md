@@ -25,7 +25,8 @@ a minimal, auditable implementation in safe Rust.
 - **AIMD congestion control** — slow-start + AIMD congestion avoidance; `send()` backpressures when the congestion window is full; `initial_ssthresh` configurable via `SmrpConfig`
 - **In-band key update** — `request_key_update()` rotates session keys mid-stream via X25519 + HKDF without a full re-handshake; Ed25519 identity pinning prevents impersonation
 - **HKDF-derived nonce prefixes** — four independent 4-byte prefixes (data-c2s/s2c, ctrl-c2s/s2c) eliminate client-controlled nonce input; full 54-byte header as DATA AEAD additional data
-- **Authenticated control packets** — ACK, KEEPALIVE_ACK, RESET, PING, PONG carry a 16-byte Poly1305 MAC tag; prevents injection of fake ACKs and RESETs
+- **Authenticated control packets** — ACK, KEEPALIVE_ACK, FIN, FIN_ACK, RESET, PING, PONG carry a 16-byte Poly1305 MAC tag; prevents injection of fake packets
+- **KEEPALIVE_ACK rate-limit** — at most one KEEPALIVE_ACK per second per connection; prevents unauthenticated KEEPALIVE amplification
 - **Server identity pinning** — `connect_with_pinned_server_key()` verifies the server's Ed25519 fingerprint after the handshake; TOFU-compatible
 - **RESET / PING / PONG** — immediate abort, RTT probing (echoes timestamp_us for clock-free RTT measurement)
 - **Persistent signing identity** — Ed25519 PKCS#8 `to_pkcs8` / `from_pkcs8`; `bind_with_config_and_key` for stable server fingerprint
@@ -63,7 +64,7 @@ All integers are big-endian.
 Offset  Size  Field
 ------  ----  -----
 0       4     Magic = 0x534D5250 ("SMRP")
-4       1     Version = 0x01
+4       1     Version = 0x03
 5       1     Packet Type
 6       1     Flags  (bit 0 = FIN, bit 1 = KEY_UPDATE_REQUESTED)
 7       1     Reserved (must be 0x00)
@@ -249,14 +250,17 @@ smrp/
 │   │   ├── conn.rs       # SmrpConnection / SmrpListener — retransmit, RESET, PING/PONG
 │   │   ├── config.rs     # SmrpConfig — timeouts, limits, retransmission tuning
 │   │   ├── constants.rs  # Compile-time wire constants
-│   │   ├── crypto.rs     # X25519, ChaCha20-Poly1305, HKDF, Ed25519 + PKCS8 persistence
+│   │   ├── crypto.rs     # X25519, ChaCha20-Poly1305, HKDF, Ed25519, SHA-256
 │   │   ├── error.rs      # SmrpError enum + wire codes
-│   │   ├── handshake.rs  # Client/server handshake logic, key derivation
+│   │   ├── handshake.rs  # Client/server handshake logic, key derivation, transcript hash
 │   │   ├── metrics.rs    # SmrpMetrics atomic counters + MetricsSnapshot
 │   │   ├── packet.rs     # Header parse/serialize, PacketType, Flags
 │   │   ├── replay.rs     # RFC 6479 anti-replay window
 │   │   ├── session.rs    # SessionId, SessionState, Session
 │   │   └── transport.rs  # Raw UDP send/recv (Windows ICMP-safe)
+│   ├── examples/
+│   │   ├── client.rs     # Minimal connect / send / recv / close example
+│   │   └── server.rs     # Minimal echo-server example
 │   └── fuzz/             # cargo-fuzz targets (requires nightly)
 │       └── fuzz_targets/
 │           ├── fuzz_packet_parse.rs   # Arbitrary bytes → header parser
@@ -265,7 +269,9 @@ smrp/
 ├── smrp-server/        # Binary: echo server with persistent signing key
 ├── smrp-cli/           # Binary: command-line client
 ├── docs/
-│   └── SPEC.md         # Full protocol specification (v0.6)
+│   ├── SPEC.md         # Full protocol specification (v0.9)
+│   └── STATE_MACHINE.md # Client/server state machine diagrams
+├── CHANGELOG.md
 └── LICENSE
 ```
 
@@ -324,7 +330,7 @@ cargo +nightly fuzz run fuzz_replay_window
 |---------------------------|--------------------------------------------------------|
 | Confidentiality           | ChaCha20-Poly1305 per packet                           |
 | Integrity                 | Poly1305 auth tag, AEAD                                |
-| Mutual authentication     | Ed25519 signatures over session ID + ephemeral pubkey  |
+| Mutual authentication     | Ed25519 signatures; HELLO_ACK transcript-bound to client HELLO via SHA-256 |
 | Forward secrecy           | Ephemeral X25519 key exchange per session              |
 | Replay protection         | RFC 6479 sliding window (128 packets), two-phase       |
 | Key separation            | HKDF derives independent c→s and s→c keys             |
@@ -335,7 +341,8 @@ cargo +nightly fuzz run fuzz_replay_window
 | DoS — session exhaustion  | MAX_SESSIONS hard cap with ERROR reply                 |
 | Dead session cleanup      | Idle sessions evicted automatically after 45 s         |
 | Server identity pinning   | Persistent Ed25519 key via PKCS#8; `connect_with_pinned_server_key()` enforces fingerprint |
-| Control packet integrity  | ACK, KEEPALIVE_ACK, RESET, PING, PONG carry Poly1305 MAC; injected fakes rejected |
+| Control packet integrity  | ACK, KEEPALIVE_ACK, FIN, FIN_ACK, RESET, PING, PONG carry Poly1305 MAC; injected fakes rejected |
+| KEEPALIVE amplification   | KEEPALIVE_ACK rate-limited to 1/second per connection                             |
 | Reliable delivery         | Per-packet retransmit buffer; Jacobson/Karels RTO      |
 | Ordered delivery          | Reorder buffer delivers application data in send order |
 | Congestion control        | AIMD slow-start + congestion avoidance; cwnd backpressure |
@@ -348,8 +355,7 @@ cargo +nightly fuzz run fuzz_replay_window
 - No fragmentation — payloads over 1 280 bytes must be split by the caller
 - Key update sequencing constraint — retransmit buffer must be empty before `request_key_update()`; additionally, DATA packets received during `request_key_update()` are discarded (the call blocks `recv_inner` while waiting for `KEY_UPDATE_ACK`)
 - Nonce prefix is 4 bytes (32 bits), derived from the session key via HKDF; prefix collision probability is negligible within a single session's key lifetime
-- KEEPALIVE probes are unauthenticated on the receive side — any host can reset the dead-session timer and elicit a `KEEPALIVE_ACK`; equivalent DoS risk to packet-flooding which is undefendable without a network-layer allowlist
-- FIN / FIN_ACK are unauthenticated (an injected FIN causes session teardown; equivalent DoS risk to packet-dropping which is also undefendable)
+- KEEPALIVE probes are unauthenticated — any host can reset the dead-session timer; KEEPALIVE_ACK is rate-limited to 1/second/connection to prevent amplification
 - **Not audited** — cryptographic usage has not been reviewed by a third party
 
 ---

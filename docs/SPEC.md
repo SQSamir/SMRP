@@ -1,9 +1,24 @@
 # SMRP Protocol Specification
 
-**Version:** 0.8  
+**Version:** 0.9  
 **Status:** Draft  
 **Authors:** Samir Gasimov
 
+> **Changelog v0.8→v0.9 (wire-breaking; version byte 0x03):**
+> **Authenticated FIN / FIN_ACK:** both teardown packets now carry a 16-byte
+> Poly1305 MAC using the HKDF-derived control-packet keys (same mechanism as
+> ACK/RESET/PING/PONG). Injected FIN packets from off-path attackers are
+> silently rejected. `SmrpListener::shutdown()` closes unaccepted connections
+> via `SmrpConnection::close()` (authenticated FIN) rather than raw UDP.
+> **HELLO_ACK transcript hash:** server now signs
+> `session_id || server_eph_pub || SHA-256(client_hello_payload)` binding the
+> HELLO_ACK to the specific HELLO it responds to; prevents replaying a
+> server's own HELLO_ACK against a different client HELLO.
+> **KEEPALIVE_ACK rate-limit:** at most one KEEPALIVE_ACK per second per
+> connection; limits amplification from unauthenticated KEEPALIVE probes.
+> `crypto::sha256()` added. `docs/STATE_MACHINE.md` added.
+> Examples `client.rs` and `server.rs` added under `smrp-core/examples/`.
+>
 > **Changelog v0.7→v0.8 (non-wire-breaking):**
 > Bug fix: `handle_key_update` (responder) now performs X25519 `agree()` and
 > derives new keys *before* transmitting `KEY_UPDATE_ACK` — previously the ACK
@@ -214,18 +229,35 @@ Client                              Server
 
 ### 7.2 HELLO / HELLO_ACK Payload (128 bytes, unencrypted)
 
+**HELLO payload (client → server):**
+
 ```
 Offset  Size  Field
-0       32    Ephemeral X25519 public key
-32      32    Ed25519 signing public key
-64      64    Ed25519 signature over (session_id[8] ‖ eph_pub[32])
+0       32    Client ephemeral X25519 public key
+32      32    Client Ed25519 signing public key
+64      64    Ed25519 signature over (session_id[8] ‖ client_eph_pub[32])
 ```
 
-Both sides sign and verify. This provides mutual authentication without a PKI:
-each party proves possession of the signing private key.
+**HELLO_ACK payload (server → client):**
 
-The signature covers `session_id || eph_pub` (40 bytes total), binding the
-ephemeral key to the session and preventing cross-session key transplant attacks.
+```
+Offset  Size  Field
+0       32    Server ephemeral X25519 public key
+32      32    Server Ed25519 signing public key
+64      64    Ed25519 signature over (session_id[8] ‖ server_eph_pub[32] ‖ SHA-256(HELLO_payload)[32])
+```
+
+Both payloads are 128 bytes and transmitted unencrypted. Mutual authentication
+is achieved without a PKI: each party proves possession of its signing private key.
+
+The HELLO signature covers `session_id || client_eph_pub` (40 bytes), binding
+the ephemeral key to the session and preventing cross-session key transplant.
+
+The HELLO_ACK signature additionally includes `SHA-256(HELLO_payload)` — a
+**transcript hash** that binds the server's response to the exact HELLO it
+received. This prevents a server from replaying its own HELLO_ACK against a
+different client HELLO (e.g., to redirect a client to a session using a
+different ephemeral key). The client verifies this binding before proceeding.
 
 ### 7.3 Key Derivation
 
@@ -557,7 +589,7 @@ These are fixed at compile time and never change at runtime.
 | Constant         | Value       | Notes                                      |
 |------------------|-------------|--------------------------------------------|
 | SMRP_MAGIC       | 0x534D5250  | ASCII "SMRP" big-endian                    |
-| SMRP_VERSION     | 0x01        | Wire version byte                          |
+| SMRP_VERSION     | 0x03        | Wire version byte                          |
 | HEADER_LEN       | 54 bytes    | Fixed packet header size                   |
 | MAX_PAYLOAD      | 1 280 bytes | Maximum plaintext application payload      |
 | AUTH_TAG_LEN     | 16 bytes    | Poly1305 tag appended to every ciphertext  |
@@ -642,12 +674,11 @@ Two-layer defence:
   for `KEY_UPDATE_ACK` are silently discarded — callers must drain pending
   ACKs and ensure no concurrent inbound DATA before initiating a rekey.
 - **KEEPALIVE unauthenticated on receive** — any host can send a spoofed
-  KEEPALIVE to reset the peer's dead-session timer and elicit a `KEEPALIVE_ACK`.
-  The risk is equivalent to packet-flooding (undefendable without a network-layer
-  allowlist) and is acceptable for a research protocol. KEEPALIVE_ACK is
-  authenticated (Poly1305 MAC) so injected fakes carry no credentials.
-- **FIN / FIN_ACK unauthenticated** — an injected FIN triggers session teardown;
-  the DoS risk is equivalent to packet-dropping (undefendable)
+  KEEPALIVE to reset the peer's dead-session timer. KEEPALIVE_ACK is
+  rate-limited to 1/second/connection (prevents amplification) and is
+  authenticated (Poly1305 MAC), so injected fakes carry no credentials.
+  The residual risk (timer reset by any host) is acceptable for a research
+  protocol and is equivalent to packet-flooding which is undefendable.
 - **Nonce entropy** — the 12-byte nonce uses a 32-bit HKDF-derived prefix; within
   a session nonce uniqueness is guaranteed by the 64-bit sequence number, but the
   32-bit prefix has negligible collision probability only within a single session's

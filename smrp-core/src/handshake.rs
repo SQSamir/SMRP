@@ -1,11 +1,20 @@
 /// SMRP handshake helpers shared by both client and server.
 ///
-/// Wire layout of the HELLO / `HELLO_ACK` payload (128 bytes, unencrypted):
+/// Wire layout of the HELLO payload (128 bytes, unencrypted):
 /// ```text
 /// [0..32]   ephemeral X25519 public key
 /// [32..64]  Ed25519 signing public key
-/// [64..128] Ed25519 signature over (session_id || ephemeral_public_key)
+/// [64..128] Ed25519 signature over (session_id[8] || ephemeral_pub[32])
 /// ```
+///
+/// Wire layout of the `HELLO_ACK` payload (128 bytes, unencrypted):
+/// ```text
+/// [0..32]   server ephemeral X25519 public key
+/// [32..64]  server Ed25519 signing public key
+/// [64..128] Ed25519 signature over (session_id[8] || server_eph_pub[32] || SHA-256(HELLO_payload)[32])
+/// ```
+/// The SHA-256 transcript binding prevents a `HELLO_ACK` from being replayed
+/// against a different `HELLO` without the server's private key.
 use crate::{
     constants::{SMRP_MAGIC, SMRP_VERSION},
     crypto::{self, derive_nonce_prefix, EphemeralKeypair, SessionKey, SigningKey},
@@ -24,6 +33,7 @@ const HELLO_PAYLOAD_LEN: usize = 32 + 32 + 64;
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Builds the HELLO payload. Signature covers `session_id[8] || eph_pub[32]`.
 fn build_hello_payload(
     eph: &EphemeralKeypair,
     sign_key: &SigningKey,
@@ -44,6 +54,7 @@ fn build_hello_payload(
     payload
 }
 
+/// Parses and verifies a HELLO payload. Returns `(eph_pub, sign_pub)`.
 fn parse_hello_payload(
     payload: &[u8],
     session_id: SessionId,
@@ -61,6 +72,58 @@ fn parse_hello_payload(
     let mut msg = Vec::with_capacity(8 + 32);
     msg.extend_from_slice(session_id.as_bytes());
     msg.extend_from_slice(&eph_pub);
+    crypto::ed25519_verify(&sign_pub, &msg, &sig)?;
+
+    Ok((eph_pub, sign_pub))
+}
+
+/// Builds the `HELLO_ACK` payload. Signature covers
+/// `session_id[8] || server_eph_pub[32] || SHA-256(client_hello_payload)[32]`.
+fn build_hello_ack_payload(
+    eph: &EphemeralKeypair,
+    sign_key: &SigningKey,
+    session_id: SessionId,
+    client_hello: &[u8],
+) -> Vec<u8> {
+    let eph_pub = eph.public_key_bytes();
+    let sign_pub = sign_key.public_key_bytes();
+    let hello_hash = crypto::sha256(client_hello);
+
+    let mut msg = Vec::with_capacity(8 + 32 + 32);
+    msg.extend_from_slice(session_id.as_bytes());
+    msg.extend_from_slice(eph_pub);
+    msg.extend_from_slice(&hello_hash);
+    let sig = sign_key.sign(&msg);
+
+    let mut payload = Vec::with_capacity(HELLO_PAYLOAD_LEN);
+    payload.extend_from_slice(eph_pub);
+    payload.extend_from_slice(sign_pub);
+    payload.extend_from_slice(&sig);
+    payload
+}
+
+/// Parses and verifies a `HELLO_ACK` payload against the transcript hash of the
+/// original `HELLO`. Returns `(server_eph_pub, server_sign_pub)`.
+fn parse_hello_ack_payload(
+    payload: &[u8],
+    session_id: SessionId,
+    client_hello: &[u8],
+) -> Result<([u8; 32], [u8; 32]), SmrpError> {
+    if payload.len() < HELLO_PAYLOAD_LEN {
+        return Err(SmrpError::MalformedHeader);
+    }
+    let mut eph_pub = [0u8; 32];
+    let mut sign_pub = [0u8; 32];
+    let mut sig = [0u8; 64];
+    eph_pub.copy_from_slice(&payload[0..32]);
+    sign_pub.copy_from_slice(&payload[32..64]);
+    sig.copy_from_slice(&payload[64..128]);
+
+    let hello_hash = crypto::sha256(client_hello);
+    let mut msg = Vec::with_capacity(8 + 32 + 32);
+    msg.extend_from_slice(session_id.as_bytes());
+    msg.extend_from_slice(&eph_pub);
+    msg.extend_from_slice(&hello_hash);
     crypto::ed25519_verify(&sign_pub, &msg, &sig)?;
 
     Ok((eph_pub, sign_pub))
@@ -133,10 +196,10 @@ pub async fn client_handshake(
 ) -> Result<Session, SmrpError> {
     let eph = EphemeralKeypair::generate()?;
     let session_id = SessionId::generate()?;
-    let payload = build_hello_payload(&eph, sign_key, session_id);
+    let hello_payload = build_hello_payload(&eph, sign_key, session_id);
 
-    let hello_hdr = make_header(PacketType::Hello, session_id, 0, 0, payload.len());
-    transport::send_raw(socket, server_addr, &hello_hdr, &payload).await?;
+    let hello_hdr = make_header(PacketType::Hello, session_id, 0, 0, hello_payload.len());
+    transport::send_raw(socket, server_addr, &hello_hdr, &hello_payload).await?;
     tracing::debug!(?session_id, "HELLO sent");
 
     let (ack_hdr, ack_payload, _) = transport::recv_raw(socket).await?;
@@ -144,7 +207,9 @@ pub async fn client_handshake(
         return Err(SmrpError::MalformedHeader);
     }
 
-    let (server_eph_pub, server_sign_pub) = parse_hello_payload(&ack_payload, session_id)?;
+    // Verify the HELLO_ACK is bound to our specific HELLO via transcript hash.
+    let (server_eph_pub, server_sign_pub) =
+        parse_hello_ack_payload(&ack_payload, session_id, &hello_payload)?;
 
     let shared = eph.agree(&server_eph_pub)?;
     let dk = derive_keys_and_prefixes(&shared, session_id)?;
@@ -189,7 +254,9 @@ pub async fn server_handshake(
     let (client_eph_pub, client_sign_pub) = parse_hello_payload(hello_payload, session_id)?;
 
     let server_eph = EphemeralKeypair::generate()?;
-    let ack_payload = build_hello_payload(&server_eph, server_sign_key, session_id);
+    // Bind HELLO_ACK to the client's HELLO via transcript hash.
+    let ack_payload =
+        build_hello_ack_payload(&server_eph, server_sign_key, session_id, hello_payload);
 
     let shared = server_eph.agree(&client_eph_pub)?;
     let dk = derive_keys_and_prefixes(&shared, session_id)?;

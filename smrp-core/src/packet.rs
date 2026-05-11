@@ -226,7 +226,7 @@ mod tests {
     fn valid_buf() -> [u8; 54] {
         let mut b = [0u8; 54];
         b[0..4].copy_from_slice(&0x534D_5250u32.to_be_bytes()); // magic
-        b[4] = 0x02; // version
+        b[4] = 0x03; // version
         b[5] = 0x03; // Data
         b[6] = 0x01; // FIN flag
         b[7] = 0x00; // reserved
@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn parse_wrong_version_returns_unsupported_version() {
         let mut buf = valid_buf();
-        buf[4] = 0x03;
+        buf[4] = 0x04;
         assert_eq!(parse(&buf).unwrap_err(), SmrpError::UnsupportedVersion);
     }
 
@@ -346,7 +346,7 @@ mod tests {
         let hdr = parse(&buf).unwrap();
 
         assert_eq!(hdr.magic, 0x534D_5250);
-        assert_eq!(hdr.version, 0x02);
+        assert_eq!(hdr.version, 0x03);
         assert_eq!(hdr.packet_type, PacketType::Data);
         assert!(hdr.flags.fin());
         assert!(!hdr.flags.key_update_requested());

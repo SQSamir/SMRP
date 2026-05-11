@@ -16,4 +16,6 @@ tokio      = { version = "1", features = ["full"] }
 tracing    = "0.1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full", "test-util"] }
+tokio              = { version = "1", features = ["full", "test-util"] }
+hex                = "0.4"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
