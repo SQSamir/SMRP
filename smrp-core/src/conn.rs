@@ -274,8 +274,8 @@ pub struct SmrpConnection {
     // --- KEY_UPDATE in-progress buffering ---
     /// Raw bytes of the recv key active just before rotation.
     /// Held so we can decrypt DATA that the initiator sent with the old key
-    /// before it received our KEY_UPDATE_ACK.  Cleared once all buffered
-    /// packets are delivered or a new KEY_UPDATE supersedes this one.
+    /// before it received our `KEY_UPDATE_ACK`.  Cleared once all buffered
+    /// packets are delivered or a new `KEY_UPDATE` supersedes this one.
     pre_rekey_recv_key_bytes: Option<[u8; 32]>,
     /// DATA packets that arrived during key rotation and were decrypted with
     /// the pre-rekey key; drained after `install_rekey_keys` completes.
@@ -299,15 +299,15 @@ pub struct SmrpConnection {
     last_pacing_refill_us: u64,
 
     // --- Connection migration ---
-    /// A pending PATH_CHALLENGE nonce we sent; Some while waiting for PATH_RESPONSE.
+    /// A pending `PATH_CHALLENGE` nonce we sent; `Some` while waiting for `PATH_RESPONSE`.
     pending_migration_nonce: Option<[u8; 8]>,
-    /// Source address of the most recent PATH_CHALLENGE we received; used to
-    /// send PATH_RESPONSE back to the right address.
+    /// Source address of the most recent `PATH_CHALLENGE` we received; used to
+    /// send `PATH_RESPONSE` back to the right address.
     #[allow(dead_code)]
     migration_challenge_addr: Option<SocketAddr>,
 
     // --- Multiplexed streams ---
-    /// Channels for non-default streams (stream_id ≠ 0).  Applications call
+    /// Channels for non-default streams (`stream_id` ≠ 0).  Applications call
     /// `open_stream()` to register a receiver end; the sender end lives here.
     stream_txs: HashMap<u16, mpsc::Sender<Vec<u8>>>,
 
@@ -465,7 +465,7 @@ impl SmrpConnection {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
     fn assemble(
         mut session: Session,
         socket: Arc<UdpSocket>,
@@ -611,14 +611,16 @@ impl SmrpConnection {
                 self.send_fragment(chunk, Some((frag_id, i as u8, frag_count)))
                     .await?;
             }
-            self.metrics.bytes_sent.fetch_add(total_len, Ordering::Relaxed);
+            self.metrics
+                .bytes_sent
+                .fetch_add(total_len, Ordering::Relaxed);
             Ok(())
         }
     }
 
     /// Refills the token bucket and waits until at least `bytes` tokens are
     /// available. Called from `send_fragment` when pacing is enabled.
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
     async fn pace_wait(&mut self, bytes: usize) {
         if !self.cfg.pacing_enabled {
             return;
@@ -633,9 +635,7 @@ impl SmrpConnection {
             state.map_or(50_000, |s| s.rtt.current)
         };
         let rtt_us = rtt_us.max(1);
-        let cwnd = {
-            self.retransmit_buf.try_lock().map_or(4, |s| s.cwnd)
-        };
+        let cwnd = { self.retransmit_buf.try_lock().map_or(4, |s| s.cwnd) };
         let bw_bytes_per_us = (cwnd * self.effective_payload) as f64 / rtt_us as f64;
         let refill = bw_bytes_per_us * elapsed_us as f64;
         let max_burst = (cwnd * self.effective_payload * 2) as f64;
@@ -800,28 +800,21 @@ impl SmrpConnection {
                             let nonce = make_nonce(&self.data_recv_nonce_prefix, seq);
                             let aad = data_aad(&hdr);
 
-                            let plaintext = match self.recv_key.open(&nonce, &aad, &payload) {
-                                Ok(p) => p,
-                                Err(_) => {
-                                    // Try the pre-rekey key if we're mid-rotation.
-                                    // DATA packets sent by the initiator before it received
-                                    // KEY_UPDATE_ACK may be encrypted with the old key.
-                                    if let Some(old_bytes) = self.pre_rekey_recv_key_bytes {
-                                        let old_key = SessionKey::from_raw(&old_bytes)
-                                            .unwrap_or_else(|_| unreachable!());
-                                        match old_key.open(&nonce, &aad, &payload) {
-                                            Ok(p) => {
-                                                // Buffer for delivery after keys are settled.
-                                                self.buffered_rekey_data.push((seq, p));
-                                                let _ = self.send_ack(self.recv_seq).await;
-                                                continue;
-                                            }
-                                            Err(_) => {}
-                                        }
+                            let Ok(plaintext) = self.recv_key.open(&nonce, &aad, &payload) else {
+                                // Try the pre-rekey key if we're mid-rotation.
+                                // DATA packets sent by the initiator before it received
+                                // `KEY_UPDATE_ACK` may be encrypted with the old key.
+                                if let Some(old_bytes) = self.pre_rekey_recv_key_bytes {
+                                    let old_key = SessionKey::from_raw(&old_bytes)
+                                        .unwrap_or_else(|_| unreachable!());
+                                    if let Ok(p) = old_key.open(&nonce, &aad, &payload) {
+                                        self.buffered_rekey_data.push((seq, p));
+                                        let _ = self.send_ack(self.recv_seq).await;
+                                        continue;
                                     }
-                                    self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
-                                    return Err(SmrpError::AuthenticationFailure);
                                 }
+                                self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                                return Err(SmrpError::AuthenticationFailure);
                             };
 
                             self.recv_replay.mark_seen(seq);
@@ -1015,7 +1008,9 @@ impl SmrpConnection {
             ack_number: self.recv_seq,
             timestamp_us: timestamp_us(),
             payload_len: payload.len() as u16,
-            frag_id: 0, frag_index: 0, frag_count: 0,
+            frag_id: 0,
+            frag_index: 0,
+            frag_count: 0,
             recv_window: self.advertised_recv_window(),
             stream_id: 0,
         };
@@ -1079,7 +1074,10 @@ impl SmrpConnection {
             ack_number: self.recv_seq,
             timestamp_us: timestamp_us(),
             payload_len: 0,
-            frag_id: 0, frag_index: 0, frag_count: 0, recv_window: 0,
+            frag_id: 0,
+            frag_index: 0,
+            frag_count: 0,
+            recv_window: 0,
             stream_id: 0,
         })
         .await
@@ -1097,7 +1095,10 @@ impl SmrpConnection {
             ack_number: ack_seq,
             timestamp_us: timestamp_us(),
             payload_len: 0,
-            frag_id: 0, frag_index: 0, frag_count: 0, recv_window: 0,
+            frag_id: 0,
+            frag_index: 0,
+            frag_count: 0,
+            recv_window: 0,
             stream_id: 0,
         })
         .await
@@ -1115,7 +1116,10 @@ impl SmrpConnection {
             ack_number: ack_seq,
             timestamp_us: timestamp_us(),
             payload_len: 0,
-            frag_id: 0, frag_index: 0, frag_count: 0, recv_window: 0,
+            frag_id: 0,
+            frag_index: 0,
+            frag_count: 0,
+            recv_window: 0,
             stream_id: 0,
         })
         .await
@@ -1133,7 +1137,10 @@ impl SmrpConnection {
             ack_number: self.recv_seq,
             timestamp_us: timestamp_us(),
             payload_len: 0,
-            frag_id: 0, frag_index: 0, frag_count: 0, recv_window: 0,
+            frag_id: 0,
+            frag_index: 0,
+            frag_count: 0,
+            recv_window: 0,
             stream_id: 0,
         })
         .await
@@ -1154,13 +1161,16 @@ impl SmrpConnection {
             ack_number: ping_seq,
             timestamp_us: ping_ts,
             payload_len: 0,
-            frag_id: 0, frag_index: 0, frag_count: 0, recv_window: 0,
+            frag_id: 0,
+            frag_index: 0,
+            frag_count: 0,
+            recv_window: 0,
             stream_id: 0,
         })
         .await
     }
 
-    /// Sends a PATH_RESPONSE containing the 8-byte challenge nonce back to the peer.
+    /// Sends a `PATH_RESPONSE` containing the 8-byte challenge nonce back to the peer.
     async fn send_path_response(&self, nonce: &[u8]) -> Result<(), SmrpError> {
         let hdr = SmrpHeader {
             magic: SMRP_MAGIC,
@@ -1173,7 +1183,10 @@ impl SmrpConnection {
             ack_number: self.recv_seq,
             timestamp_us: timestamp_us(),
             payload_len: nonce.len() as u16,
-            frag_id: 0, frag_index: 0, frag_count: 0, recv_window: 0,
+            frag_id: 0,
+            frag_index: 0,
+            frag_count: 0,
+            recv_window: 0,
             stream_id: 0,
         };
         transport::send_raw(&self.socket, self.peer_addr, &hdr, nonce).await
@@ -1202,10 +1215,16 @@ impl SmrpConnection {
             self.frag_send_id = self.frag_send_id.wrapping_add(1);
             let total_len = data.len() as u64;
             for (i, chunk) in chunks.into_iter().enumerate() {
-                self.send_fragment_on_stream(chunk, Some((frag_id, i as u8, frag_count)), stream_id)
-                    .await?;
+                self.send_fragment_on_stream(
+                    chunk,
+                    Some((frag_id, i as u8, frag_count)),
+                    stream_id,
+                )
+                .await?;
             }
-            self.metrics.bytes_sent.fetch_add(total_len, Ordering::Relaxed);
+            self.metrics
+                .bytes_sent
+                .fetch_add(total_len, Ordering::Relaxed);
             Ok(())
         }
     }
@@ -1279,15 +1298,20 @@ impl SmrpConnection {
         let ciphertext = self.send_key.seal(&nonce, &aad, data)?;
         transport::send_raw(&self.socket, self.peer_addr, &hdr, &ciphertext).await?;
         self.send_seq += 1;
-        self.retransmit_buf.lock().await.pending.insert(seq, RetransmitEntry {
-            header: hdr,
-            ciphertext,
-            sent_at: Instant::now(),
-            retries: 0,
-        });
+        self.retransmit_buf.lock().await.pending.insert(
+            seq,
+            RetransmitEntry {
+                header: hdr,
+                ciphertext,
+                sent_at: Instant::now(),
+                retries: 0,
+            },
+        );
         if frag_info.is_none() {
             self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-            self.metrics.bytes_sent.fetch_add(data.len() as u64, Ordering::Relaxed);
+            self.metrics
+                .bytes_sent
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
         } else {
             self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
         }
@@ -1305,11 +1329,9 @@ impl SmrpConnection {
         }
         let nonce = make_nonce(&self.ctrl_recv_nonce_prefix, hdr.sequence_number);
         let aad = serialize_hdr(hdr);
-        self.recv_key
-            .open(&nonce, &aad, payload)
-            .inspect_err(|_| {
-                self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
-            })
+        self.recv_key.open(&nonce, &aad, payload).inspect_err(|_| {
+            self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+        })
     }
 
     /// Removes all retransmit-pending entries with seq ≤ `ack_n` (cumulative ACK).
@@ -1530,7 +1552,9 @@ impl SmrpConnection {
             ack_number: self.recv_seq,
             timestamp_us: timestamp_us(),
             payload_len: ack_payload.len() as u16,
-            frag_id: 0, frag_index: 0, frag_count: 0,
+            frag_id: 0,
+            frag_index: 0,
+            frag_count: 0,
             recv_window: self.advertised_recv_window(),
             stream_id: 0,
         };
@@ -1557,18 +1581,29 @@ impl SmrpConnection {
                 for (seq, plaintext) in buffered {
                     if self.recv_buf.len() < self.recv_buf_limit {
                         // Re-inject as if it just arrived; use a dummy header.
-                        self.recv_buf.insert(seq, (
-                            SmrpHeader {
-                                magic: SMRP_MAGIC, version: SMRP_VERSION,
-                                packet_type: PacketType::Data, flags: Flags::default(),
-                                reserved: 0, session_id: self.session_id,
-                                sequence_number: seq, ack_number: 0,
-                                timestamp_us: 0, payload_len: 0,
-                                frag_id: 0, frag_index: 0, frag_count: 1,
-                                recv_window: 0, stream_id: 0,
-                            },
-                            plaintext,
-                        ));
+                        self.recv_buf.insert(
+                            seq,
+                            (
+                                SmrpHeader {
+                                    magic: SMRP_MAGIC,
+                                    version: SMRP_VERSION,
+                                    packet_type: PacketType::Data,
+                                    flags: Flags::default(),
+                                    reserved: 0,
+                                    session_id: self.session_id,
+                                    sequence_number: seq,
+                                    ack_number: 0,
+                                    timestamp_us: 0,
+                                    payload_len: 0,
+                                    frag_id: 0,
+                                    frag_index: 0,
+                                    frag_count: 1,
+                                    recv_window: 0,
+                                    stream_id: 0,
+                                },
+                                plaintext,
+                            ),
+                        );
                     }
                 }
                 self.pre_rekey_recv_key_bytes = None;
@@ -1618,6 +1653,81 @@ impl SmrpConnection {
 
     /// Processes a single received packet. Returns `Err` on auth failure,
     /// or `Ok(())` to continue (data may be appended to `deliver_queue`).
+    async fn handle_data_packet(
+        &mut self,
+        hdr: SmrpHeader,
+        payload: Vec<u8>,
+    ) -> Result<(), SmrpError> {
+        let seq = hdr.sequence_number;
+        if self.recv_replay.can_accept(seq).is_err() {
+            self.metrics
+                .replay_detections
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = self.send_ack(self.recv_seq).await;
+            return Ok(());
+        }
+        let nonce = make_nonce(&self.data_recv_nonce_prefix, seq);
+        let aad = data_aad(&hdr);
+        let Ok(plaintext) = self.recv_key.open(&nonce, &aad, &payload) else {
+            if let Some(old_bytes) = self.pre_rekey_recv_key_bytes {
+                let old_key = SessionKey::from_raw(&old_bytes).unwrap_or_else(|_| unreachable!());
+                if let Ok(p) = old_key.open(&nonce, &aad, &payload) {
+                    self.buffered_rekey_data.push((seq, p));
+                    let _ = self.send_ack(self.recv_seq).await;
+                    return Ok(());
+                }
+            }
+            self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+            return Err(SmrpError::AuthenticationFailure);
+        };
+        self.recv_replay.mark_seen(seq);
+        if self.recv_buf.len() < self.recv_buf_limit {
+            self.recv_buf.insert(seq, (hdr, plaintext));
+        }
+        while let Some((pkt_hdr, raw)) = self.recv_buf.remove(&self.next_deliver_seq) {
+            self.recv_seq = self.next_deliver_seq;
+            self.next_deliver_seq += 1;
+            self.metrics
+                .packets_received
+                .fetch_add(1, Ordering::Relaxed);
+            let assembled_data = if pkt_hdr.flags.fragment() {
+                let frag_complete = {
+                    let entry = self
+                        .reassembly
+                        .entry(pkt_hdr.frag_id)
+                        .or_insert_with(|| FragmentAssembly::new(pkt_hdr.frag_count));
+                    entry.insert(pkt_hdr.frag_index, raw)
+                };
+                if frag_complete {
+                    Some((
+                        pkt_hdr.stream_id,
+                        self.reassembly.remove(&pkt_hdr.frag_id).unwrap().assemble(),
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                Some((pkt_hdr.stream_id, raw))
+            };
+            if let Some((stream_id, msg)) = assembled_data {
+                self.metrics
+                    .bytes_received
+                    .fetch_add(msg.len() as u64, Ordering::Relaxed);
+                if stream_id == 0 {
+                    self.deliver_queue.push_back(msg);
+                } else if let Some(tx) = self.stream_txs.get(&stream_id) {
+                    let _ = tx.try_send(msg);
+                }
+            }
+        }
+        if self.recv_buf.is_empty() {
+            let _ = self.send_ack(self.recv_seq).await;
+        } else {
+            let _ = self.send_sack().await;
+        }
+        Ok(())
+    }
+
     async fn process_one_packet(
         &mut self,
         hdr: SmrpHeader,
@@ -1625,70 +1735,12 @@ impl SmrpConnection {
     ) -> Result<(), SmrpError> {
         match hdr.packet_type {
             PacketType::Data => {
-                let seq = hdr.sequence_number;
-                if self.recv_replay.can_accept(seq).is_err() {
-                    self.metrics.replay_detections.fetch_add(1, Ordering::Relaxed);
-                    let _ = self.send_ack(self.recv_seq).await;
-                    return Ok(());
-                }
-                let nonce = make_nonce(&self.data_recv_nonce_prefix, seq);
-                let aad = data_aad(&hdr);
-                let plaintext = match self.recv_key.open(&nonce, &aad, &payload) {
-                    Ok(p) => p,
-                    Err(_) => {
-                        if let Some(old_bytes) = self.pre_rekey_recv_key_bytes {
-                            let old_key = SessionKey::from_raw(&old_bytes)
-                                .unwrap_or_else(|_| unreachable!());
-                            if let Ok(p) = old_key.open(&nonce, &aad, &payload) {
-                                self.buffered_rekey_data.push((seq, p));
-                                let _ = self.send_ack(self.recv_seq).await;
-                                return Ok(());
-                            }
-                        }
-                        self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
-                        return Err(SmrpError::AuthenticationFailure);
-                    }
-                };
-                self.recv_replay.mark_seen(seq);
-                if self.recv_buf.len() < self.recv_buf_limit {
-                    self.recv_buf.insert(seq, (hdr, plaintext));
-                }
-                while let Some((pkt_hdr, raw)) = self.recv_buf.remove(&self.next_deliver_seq) {
-                    self.recv_seq = self.next_deliver_seq;
-                    self.next_deliver_seq += 1;
-                    self.metrics.packets_received.fetch_add(1, Ordering::Relaxed);
-                    let assembled_data = if pkt_hdr.flags.fragment() {
-                        let frag_complete = {
-                            let entry = self.reassembly
-                                .entry(pkt_hdr.frag_id)
-                                .or_insert_with(|| FragmentAssembly::new(pkt_hdr.frag_count));
-                            entry.insert(pkt_hdr.frag_index, raw)
-                        };
-                        if frag_complete {
-                            Some((pkt_hdr.stream_id, self.reassembly.remove(&pkt_hdr.frag_id).unwrap().assemble()))
-                        } else {
-                            None
-                        }
-                    } else {
-                        Some((pkt_hdr.stream_id, raw))
-                    };
-                    if let Some((stream_id, msg)) = assembled_data {
-                        self.metrics.bytes_received.fetch_add(msg.len() as u64, Ordering::Relaxed);
-                        if stream_id == 0 {
-                            self.deliver_queue.push_back(msg);
-                        } else if let Some(tx) = self.stream_txs.get(&stream_id) {
-                            let _ = tx.try_send(msg);
-                        }
-                    }
-                }
-                if self.recv_buf.is_empty() {
-                    let _ = self.send_ack(self.recv_seq).await;
-                } else {
-                    let _ = self.send_sack().await;
-                }
+                return self.handle_data_packet(hdr, payload).await;
             }
             PacketType::Ack => {
-                if self.open_ctrl_payload(&hdr, &payload).is_err() { return Ok(()); }
+                if self.open_ctrl_payload(&hdr, &payload).is_err() {
+                    return Ok(());
+                }
                 {
                     let mut buf = self.retransmit_buf.lock().await;
                     buf.peer_recv_window = hdr.recv_window;
@@ -1701,20 +1753,26 @@ impl SmrpConnection {
                 self.process_cumulative_ack(hdr.ack_number).await;
             }
             PacketType::SackAck => {
-                let Ok(sack_data) = self.open_ctrl_payload(&hdr, &payload) else { return Ok(()); };
+                let Ok(sack_data) = self.open_ctrl_payload(&hdr, &payload) else {
+                    return Ok(());
+                };
                 {
                     let mut buf = self.retransmit_buf.lock().await;
                     buf.peer_recv_window = hdr.recv_window;
                     let blocks = parse_sack_blocks(&sack_data);
                     for (start, end) in blocks {
-                        for seq in start..=end { buf.sacked.insert(seq); }
+                        for seq in start..=end {
+                            buf.sacked.insert(seq);
+                        }
                     }
                     buf.sacked.retain(|&s| s > hdr.ack_number);
                 }
                 self.process_cumulative_ack(hdr.ack_number).await;
             }
             PacketType::Fin => {
-                if self.open_ctrl_payload(&hdr, &payload).is_err() { return Ok(()); }
+                if self.open_ctrl_payload(&hdr, &payload).is_err() {
+                    return Ok(());
+                }
                 let _ = self.send_fin_ack(hdr.sequence_number).await;
                 self.mark_closed();
             }
@@ -1726,11 +1784,15 @@ impl SmrpConnection {
                 }
             }
             PacketType::Ping => {
-                if self.open_ctrl_payload(&hdr, &payload).is_err() { return Ok(()); }
+                if self.open_ctrl_payload(&hdr, &payload).is_err() {
+                    return Ok(());
+                }
                 let _ = self.send_pong(hdr.sequence_number, hdr.timestamp_us).await;
             }
             PacketType::Pong => {
-                if self.open_ctrl_payload(&hdr, &payload).is_err() { return Ok(()); }
+                if self.open_ctrl_payload(&hdr, &payload).is_err() {
+                    return Ok(());
+                }
                 let rtt_us = timestamp_us().saturating_sub(hdr.timestamp_us);
                 if rtt_us > 0 && rtt_us < 60_000_000 {
                     self.retransmit_buf.lock().await.rtt.update(rtt_us);
@@ -1801,8 +1863,14 @@ impl SmrpConnection {
         drop(dummy_tx);
         drop(dummy_dead_tx);
         let inner = Arc::new(tokio::sync::Mutex::new(inner_conn));
-        let sender = SmrpSender { inner: Arc::clone(&inner) };
-        let receiver = SmrpReceiver { inner, data_rx, dead_rx };
+        let sender = SmrpSender {
+            inner: Arc::clone(&inner),
+        };
+        let receiver = SmrpReceiver {
+            inner,
+            data_rx,
+            dead_rx,
+        };
         (sender, receiver)
     }
 }
@@ -1833,7 +1901,11 @@ impl SmrpSender {
     /// # Errors
     /// Same as [`SmrpConnection::send_on_stream`].
     pub async fn send_on_stream(&self, stream_id: u16, data: &[u8]) -> Result<(), SmrpError> {
-        self.inner.lock().await.send_on_stream(stream_id, data).await
+        self.inner
+            .lock()
+            .await
+            .send_on_stream(stream_id, data)
+            .await
     }
 
     /// Initiates a key update; see [`SmrpConnection::request_key_update`].
@@ -1887,7 +1959,8 @@ impl SmrpReceiver {
     /// # Errors
     /// Same as [`SmrpConnection::recv_timeout`].
     pub async fn recv_timeout(&mut self, deadline: Duration) -> Result<Option<Vec<u8>>, SmrpError> {
-        time::timeout(deadline, self.recv_inner()).await
+        time::timeout(deadline, self.recv_inner())
+            .await
             .map_err(|_| SmrpError::HandshakeTimeout)?
     }
 
@@ -2539,7 +2612,10 @@ async fn send_error_reply(
         ack_number: 0,
         timestamp_us: timestamp_us(),
         payload_len: 1,
-        frag_id: 0, frag_index: 0, frag_count: 0, recv_window: 0,
+        frag_id: 0,
+        frag_index: 0,
+        frag_count: 0,
+        recv_window: 0,
         stream_id: 0,
     };
     let _ = transport::send_raw(socket, addr, &hdr, &[err.wire_code()]).await;

@@ -6,6 +6,7 @@ use std::time::Duration;
 /// pass to [`SmrpListener::bind_with_config`] or
 /// [`SmrpConnection::connect_with_config`].
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct SmrpConfig {
     /// How often to send a KEEPALIVE probe when the session is idle.
     /// Default: 15 s.
@@ -105,13 +106,13 @@ pub struct SmrpConfig {
 
     // ---- Multiplexed streams ------------------------------------------------
     /// Maximum number of concurrent logical streams per session.
-    /// Stream IDs 0..max_streams are valid; 0 is the default (control) stream.
+    /// Stream IDs `0..max_streams` are valid; 0 is the default (control) stream.
     /// Default: 256.
     pub max_streams: u16,
 
     // ---- Connection migration -----------------------------------------------
     /// Allow the remote peer to migrate the session to a new address via
-    /// PATH_CHALLENGE / PATH_RESPONSE. Default: true.
+    /// `PATH_CHALLENGE` / `PATH_RESPONSE`. Default: true.
     pub migration_enabled: bool,
 }
 

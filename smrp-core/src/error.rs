@@ -95,7 +95,6 @@ impl SmrpError {
             0x07 => Self::HandshakeTimeout,
             0x08 => Self::SessionLimitExceeded,
             0x09 => Self::PayloadTooLarge,
-            0x0A => Self::InternalError,
             0x0B => Self::StreamClosed,
             0x0C => Self::TooManyStreams,
             _ => Self::InternalError,
