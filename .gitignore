@@ -17,3 +17,7 @@ Thumbs.db
 .env
 *.key
 *.pem
+.claude
+AGENTS.md
+CLAUDE.md
+.mcp.json

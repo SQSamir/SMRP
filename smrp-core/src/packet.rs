@@ -14,7 +14,7 @@ pub fn timestamp_us() -> u64 {
         .map_or(0, |d| d.as_micros() as u64)
 }
 
-/// Every packet type defined by the SMRP wire protocol (wire values 0x01–0x0A).
+/// Every packet type defined by the SMRP wire protocol (wire values 0x01–0x11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PacketType {
@@ -48,6 +48,10 @@ pub enum PacketType {
     Pong = 0x0E,
     /// Selective acknowledgement; carries SACK blocks for out-of-order ranges.
     SackAck = 0x0F,
+    /// Connection migration: challenges the peer to prove reachability at a new address.
+    PathChallenge = 0x10,
+    /// Connection migration: response proving reachability, echoes the challenge nonce.
+    PathResponse = 0x11,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -70,6 +74,8 @@ impl TryFrom<u8> for PacketType {
             0x0D => Ok(Self::Ping),
             0x0E => Ok(Self::Pong),
             0x0F => Ok(Self::SackAck),
+            0x10 => Ok(Self::PathChallenge),
+            0x11 => Ok(Self::PathResponse),
             _ => Err(SmrpError::MalformedHeader),
         }
     }
@@ -86,6 +92,10 @@ impl Flags {
     pub const KEY_UPDATE_REQUESTED: u8 = 0b0000_0010;
     /// Bit 2 — this DATA packet carries a fragment of a larger message.
     pub const FRAGMENT: u8 = 0b0000_0100;
+    /// Bit 3 — IP ECN-Capable Transport; mirrors the ECT(0) codepoint received on ingress.
+    pub const ECT: u8 = 0b0000_1000;
+    /// Bit 4 — IP Congestion Experienced; mirrors the CE codepoint received on ingress.
+    pub const CE: u8 = 0b0001_0000;
 
     /// Returns `true` when the FIN bit is set.
     #[must_use]
@@ -103,6 +113,18 @@ impl Flags {
     #[must_use]
     pub fn fragment(self) -> bool {
         self.0 & Self::FRAGMENT != 0
+    }
+
+    /// Returns `true` when the ECN-Capable Transport bit is set.
+    #[must_use]
+    pub fn ect(self) -> bool {
+        self.0 & Self::ECT != 0
+    }
+
+    /// Returns `true` when the Congestion Experienced bit is set.
+    #[must_use]
+    pub fn ce(self) -> bool {
+        self.0 & Self::CE != 0
     }
 }
 
@@ -131,11 +153,11 @@ impl Flags {
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// |         payload_len (2)       |   frag_id (2) |fi(1)  |fc(1)  |
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// |       recv_window (2)         |        reserved2 (4)           |
+/// |       recv_window (2)         |    stream_id (2)  | rsvd2 (4) |
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// ```
-/// Total: 4+1+1+1+1+8+8+8+8+2+2+1+1+2+4 = 54 bytes.
-/// fi = `frag_index`, fc = `frag_count`.
+/// Total: 4+1+1+1+1+8+8+8+8+2+2+1+1+2+2+4 = 54 bytes.
+/// fi = `frag_index`, fc = `frag_count`, rsvd2 = bytes 50–53 (reserved).
 #[derive(Debug, Clone)]
 #[repr(C)]
 pub struct SmrpHeader {
@@ -168,6 +190,8 @@ pub struct SmrpHeader {
     pub frag_count: u8,
     /// Receiver's remaining buffer space in packets; used for flow control.
     pub recv_window: u16,
+    /// Logical stream identifier within this session (0 = default stream).
+    pub stream_id: u16,
 }
 
 /// Parses the first [`HEADER_LEN`] bytes of `src` into an [`SmrpHeader`].
@@ -210,6 +234,7 @@ pub fn parse(src: &[u8]) -> Result<SmrpHeader, SmrpError> {
     let frag_index = cursor.get_u8();
     let frag_count = cursor.get_u8();
     let recv_window = cursor.get_u16();
+    let stream_id = cursor.get_u16();
     // bytes 50-53: reserved2 — skip
 
     Ok(SmrpHeader {
@@ -227,6 +252,7 @@ pub fn parse(src: &[u8]) -> Result<SmrpHeader, SmrpError> {
         frag_index,
         frag_count,
         recv_window,
+        stream_id,
     })
 }
 
@@ -248,7 +274,8 @@ pub fn serialize(header: &SmrpHeader) -> [u8; HEADER_LEN] {
     buf[44] = header.frag_index;
     buf[45] = header.frag_count;
     buf[46..48].copy_from_slice(&header.recv_window.to_be_bytes());
-    // bytes 48-53: reserved2 — remain zero
+    buf[48..50].copy_from_slice(&header.stream_id.to_be_bytes());
+    // bytes 50-53: reserved2 — remain zero
     buf
 }
 
@@ -262,7 +289,7 @@ mod tests {
     fn valid_buf() -> [u8; 54] {
         let mut b = [0u8; 54];
         b[0..4].copy_from_slice(&0x534D_5250u32.to_be_bytes()); // magic
-        b[4] = 0x04; // version
+        b[4] = 0x05; // version
         b[5] = 0x03; // Data
         b[6] = 0x01; // FIN flag
         b[7] = 0x00; // reserved
@@ -295,6 +322,8 @@ mod tests {
             (0x0D, PacketType::Ping),
             (0x0E, PacketType::Pong),
             (0x0F, PacketType::SackAck),
+            (0x10, PacketType::PathChallenge),
+            (0x11, PacketType::PathResponse),
         ];
         for (byte, expected) in cases {
             assert_eq!(PacketType::try_from(*byte).unwrap(), *expected);
@@ -308,8 +337,8 @@ mod tests {
 
     #[test]
     fn packet_type_out_of_range_is_invalid() {
-        // 0x10 and above are undefined; 0x0F (SackAck) is the highest valid code.
-        assert_eq!(PacketType::try_from(0x10), Err(SmrpError::MalformedHeader));
+        // 0x12 and above are undefined; 0x11 (PathResponse) is the highest valid code.
+        assert_eq!(PacketType::try_from(0x12), Err(SmrpError::MalformedHeader));
         assert_eq!(PacketType::try_from(0xFF), Err(SmrpError::MalformedHeader));
     }
 
@@ -353,6 +382,29 @@ mod tests {
         assert!(f.key_update_requested());
     }
 
+    #[test]
+    fn flags_ect_bit() {
+        let f = Flags(Flags::ECT);
+        assert!(f.ect());
+        assert!(!f.ce());
+        assert!(!f.fin());
+    }
+
+    #[test]
+    fn flags_ce_bit() {
+        let f = Flags(Flags::CE);
+        assert!(f.ce());
+        assert!(!f.ect());
+    }
+
+    #[test]
+    fn flags_ecn_bits_independent() {
+        let f = Flags(Flags::ECT | Flags::CE);
+        assert!(f.ect());
+        assert!(f.ce());
+        assert!(!f.fin());
+    }
+
     // --- parse() ---
 
     #[test]
@@ -376,7 +428,7 @@ mod tests {
     #[test]
     fn parse_wrong_version_returns_unsupported_version() {
         let mut buf = valid_buf();
-        buf[4] = 0x05;
+        buf[4] = 0x06;
         assert_eq!(parse(&buf).unwrap_err(), SmrpError::UnsupportedVersion);
     }
 
@@ -393,7 +445,7 @@ mod tests {
         let hdr = parse(&buf).unwrap();
 
         assert_eq!(hdr.magic, 0x534D_5250);
-        assert_eq!(hdr.version, 0x04);
+        assert_eq!(hdr.version, 0x05);
         assert_eq!(hdr.packet_type, PacketType::Data);
         assert!(hdr.flags.fin());
         assert!(!hdr.flags.key_update_requested());
@@ -402,6 +454,15 @@ mod tests {
         assert_eq!(hdr.ack_number, 41);
         assert_eq!(hdr.timestamp_us, 1_000_000);
         assert_eq!(hdr.payload_len, 512);
+        assert_eq!(hdr.stream_id, 0);
+    }
+
+    #[test]
+    fn parse_stream_id_round_trips() {
+        let mut buf = valid_buf();
+        buf[48..50].copy_from_slice(&1234u16.to_be_bytes());
+        let hdr = parse(&buf).unwrap();
+        assert_eq!(hdr.stream_id, 1234);
     }
 
     #[test]

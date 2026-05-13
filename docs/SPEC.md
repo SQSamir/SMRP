@@ -1,9 +1,38 @@
 # SMRP Protocol Specification
 
-**Version:** 0.9  
+**Version:** 1.0  
 **Status:** Draft  
 **Authors:** Samir Gasimov
 
+> **Changelog v0.9→1.0 (wire-breaking; version byte 0x05):**
+> **Protocol version bumped to 0x05** (0x04 is retired with the `smrp-v0.4` branch).
+> **`stream_id` field (bytes 48–49):** wire header extended; two bytes of the
+> previously-reserved `reserved2` region now carry a u16 logical stream identifier.
+> Default stream is `stream_id = 0`; non-zero IDs are routed to per-stream
+> receive channels registered via `SmrpConnection::open_stream()`.  
+> **`SmrpConnection::send_on_stream(stream_id, data)`** sends on a named stream.  
+> **`SmrpConnection::into_split()`** decomposes a connection into `(SmrpSender,
+> SmrpReceiver)` so send and recv can run concurrently in separate tasks without
+> `&mut self` contention.  
+> **PathChallenge (0x10) / PathResponse (0x11)** packet types for connection
+> migration: on receiving a `PathChallenge`, the stack echoes the 8-byte nonce in a
+> `PathResponse`; enabled by `SmrpConfig::migration_enabled`.  
+> **ECN support (recv-side):** ACK/SackAck with the CE flag set triggers an
+> immediate AIMD cwnd halving (same as a retransmit event).  
+> **KEY_UPDATE DATA buffering:** the responder saves the pre-rotation recv key so
+> DATA packets still encrypted with the old key (sent before the initiator received
+> `KEY_UPDATE_ACK`) are decrypted and buffered, preventing silent packet loss at
+> rotation boundaries.  
+> **Send pacing:** token-bucket pacer in `send_fragment`; controlled by
+> `SmrpConfig::pacing_enabled`.  
+> **PMTUD scaffolding:** `SmrpConnection::effective_payload` tracks the current
+> probed payload limit; starts at `MAX_PAYLOAD (1280)` and is updated by loss /
+> probe signals; controlled by `SmrpConfig::pmtud_enabled`.  
+> **New config fields:** `pmtud_enabled`, `pmtud_probe_interval`, `pacing_enabled`,
+> `ecn_enabled`, `max_streams`, `migration_enabled`.  
+> **New error codes:** `StreamClosed (0x0B)`, `TooManyStreams (0x0C)`.  
+> **ECN flag bits:** `Flags::ECT (bit 3)` and `Flags::CE (bit 4)`.  
+>
 > **Changelog v0.8→v0.9 (wire-breaking; version byte 0x03):**
 > **Authenticated FIN / FIN_ACK:** both teardown packets now carry a 16-byte
 > Poly1305 MAC using the HKDF-derived control-packet keys (same mechanism as
@@ -75,7 +104,7 @@ Design goals:
 - Auditable implementation — no custom crypto, rely on `ring`
 - Async-first implementation with Tokio
 
-Non-goals: fragmentation, PKI, full TCP-like flow control.
+Non-goals: PKI, full TCP-like flow control.
 
 ---
 

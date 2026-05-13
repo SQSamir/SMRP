@@ -49,6 +49,14 @@ pub enum SmrpError {
     /// 0x0A — An internal error occurred that is not covered by other codes.
     #[error("internal error (0x0A)")]
     InternalError,
+
+    /// 0x0B — The referenced stream has already been closed.
+    #[error("stream closed (0x0B)")]
+    StreamClosed,
+
+    /// 0x0C — Opening this stream would exceed the negotiated stream limit.
+    #[error("too many streams (0x0C)")]
+    TooManyStreams,
 }
 
 impl SmrpError {
@@ -67,6 +75,8 @@ impl SmrpError {
             Self::SessionLimitExceeded => 0x08,
             Self::PayloadTooLarge => 0x09,
             Self::InternalError => 0x0A,
+            Self::StreamClosed => 0x0B,
+            Self::TooManyStreams => 0x0C,
         }
     }
 
@@ -85,6 +95,9 @@ impl SmrpError {
             0x07 => Self::HandshakeTimeout,
             0x08 => Self::SessionLimitExceeded,
             0x09 => Self::PayloadTooLarge,
+            0x0A => Self::InternalError,
+            0x0B => Self::StreamClosed,
+            0x0C => Self::TooManyStreams,
             _ => Self::InternalError,
         }
     }
@@ -107,6 +120,8 @@ mod tests {
         (SmrpError::SessionLimitExceeded, 0x08),
         (SmrpError::PayloadTooLarge, 0x09),
         (SmrpError::InternalError, 0x0A),
+        (SmrpError::StreamClosed, 0x0B),
+        (SmrpError::TooManyStreams, 0x0C),
     ];
 
     #[test]
@@ -126,12 +141,12 @@ mod tests {
     #[test]
     fn unknown_wire_code_yields_internal_error() {
         assert_eq!(SmrpError::from_wire_code(0xFF), SmrpError::InternalError);
-        assert_eq!(SmrpError::from_wire_code(0x0B), SmrpError::InternalError);
+        assert_eq!(SmrpError::from_wire_code(0x0D), SmrpError::InternalError);
     }
 
     #[test]
-    fn all_11_variants_covered() {
-        assert_eq!(ALL_VARIANTS.len(), 11);
+    fn all_13_variants_covered() {
+        assert_eq!(ALL_VARIANTS.len(), 13);
     }
 
     #[test]

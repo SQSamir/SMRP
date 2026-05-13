@@ -179,6 +179,7 @@ fn make_header(
         frag_index: 0,
         frag_count: 0,
         recv_window: 0,
+        stream_id: 0,
     }
 }
 

@@ -2,7 +2,7 @@
 pub const SMRP_MAGIC: u32 = 0x534D_5250;
 
 /// Protocol version carried in every packet header.
-pub const SMRP_VERSION: u8 = 0x04;
+pub const SMRP_VERSION: u8 = 0x05;
 
 /// Fixed size of the SMRP packet header in bytes.
 pub const HEADER_LEN: usize = 54;

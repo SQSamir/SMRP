@@ -65,6 +65,9 @@ impl EphemeralKeypair {
 /// A symmetric session key wrapping ChaCha20-Poly1305.
 pub struct SessionKey {
     inner: aead::LessSafeKey,
+    /// Raw key bytes retained so the caller can derive `pre_rekey` snapshots
+    /// without requiring `ring::aead::LessSafeKey` to implement Clone.
+    raw: [u8; 32],
 }
 
 impl SessionKey {
@@ -77,7 +80,14 @@ impl SessionKey {
             .map_err(|_| SmrpError::InternalError)?;
         Ok(Self {
             inner: aead::LessSafeKey::new(unbound),
+            raw: *key_bytes,
         })
+    }
+
+    /// Returns the underlying 32-byte key material.
+    #[must_use]
+    pub fn raw_bytes(&self) -> &[u8; 32] {
+        &self.raw
     }
 
     /// Encrypts `plaintext` returning ciphertext + 16-byte Poly1305 tag.

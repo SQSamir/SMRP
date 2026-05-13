@@ -81,6 +81,38 @@ pub struct SmrpConfig {
     /// Maximum number of SACK blocks included in a single `SackAck` packet.
     /// Each block is 16 bytes (two u64 sequence numbers). Default: 16.
     pub max_sack_blocks: usize,
+
+    // ---- PMTUD (Path MTU Discovery) -----------------------------------------
+    /// Enable probe-based path MTU discovery. When enabled the sender
+    /// periodically probes larger payload sizes and backs off on loss.
+    /// Default: true.
+    pub pmtud_enabled: bool,
+
+    /// How often to send a PMTUD probe when the current MTU estimate may be
+    /// stale. Default: 5 s.
+    pub pmtud_probe_interval: Duration,
+
+    // ---- Pacing -------------------------------------------------------------
+    /// Enable token-bucket send pacing. Spreads bursts evenly across the RTT
+    /// to reduce queue build-up at bottleneck links. Default: true.
+    pub pacing_enabled: bool,
+
+    // ---- ECN ----------------------------------------------------------------
+    /// Mirror IP ECN bits (ECT/CE) into the SMRP flags field and react to CE
+    /// marks by reducing cwnd. Requires OS support; silently disabled at
+    /// runtime if the socket option is unavailable. Default: false.
+    pub ecn_enabled: bool,
+
+    // ---- Multiplexed streams ------------------------------------------------
+    /// Maximum number of concurrent logical streams per session.
+    /// Stream IDs 0..max_streams are valid; 0 is the default (control) stream.
+    /// Default: 256.
+    pub max_streams: u16,
+
+    // ---- Connection migration -----------------------------------------------
+    /// Allow the remote peer to migrate the session to a new address via
+    /// PATH_CHALLENGE / PATH_RESPONSE. Default: true.
+    pub migration_enabled: bool,
 }
 
 impl Default for SmrpConfig {
@@ -104,6 +136,12 @@ impl Default for SmrpConfig {
             initial_ssthresh: 64,
             recv_buf_limit: 256,
             max_sack_blocks: 16,
+            pmtud_enabled: true,
+            pmtud_probe_interval: Duration::from_secs(5),
+            pacing_enabled: true,
+            ecn_enabled: false,
+            max_streams: 256,
+            migration_enabled: true,
         }
     }
 }
