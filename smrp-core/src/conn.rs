@@ -940,12 +940,12 @@ impl SmrpConnection {
                             self.handle_key_update(hdr.sequence_number, &payload).await;
                         }
 
-                        PacketType::PathChallenge => {
+                        PacketType::PathChallenge
+                            if payload.len() >= 8 && self.cfg.migration_enabled =>
+                        {
                             // Echo the 8-byte challenge nonce back in a PathResponse.
                             // No auth required: the response is bound to the nonce.
-                            if payload.len() >= 8 && self.cfg.migration_enabled {
-                                let _ = self.send_path_response(&payload[..8]).await;
-                            }
+                            let _ = self.send_path_response(&payload[..8]).await;
                         }
 
                         PacketType::PathResponse => {
@@ -1801,10 +1801,8 @@ impl SmrpConnection {
             PacketType::KeyUpdate => {
                 self.handle_key_update(hdr.sequence_number, &payload).await;
             }
-            PacketType::PathChallenge => {
-                if payload.len() >= 8 && self.cfg.migration_enabled {
-                    let _ = self.send_path_response(&payload[..8]).await;
-                }
+            PacketType::PathChallenge if payload.len() >= 8 && self.cfg.migration_enabled => {
+                let _ = self.send_path_response(&payload[..8]).await;
             }
             PacketType::PathResponse => {
                 if let Some(nonce) = self.pending_migration_nonce {
