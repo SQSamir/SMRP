@@ -50,7 +50,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -203,6 +203,18 @@ impl FragmentAssembly {
 
 type RetransmitBuf = Arc<tokio::sync::Mutex<RetransmitState>>;
 
+/// Key material shared between [`SmrpConnection`] and the keepalive task so
+/// that KEEPALIVE packets can be Poly1305-authenticated.
+///
+/// A dedicated sequence counter (starting above `1u64 << 48`) avoids nonce
+/// collisions with the main `ctrl_send_seq` counter.
+struct KeepaliveAuth {
+    send_key_bytes: [u8; 32],
+    ctrl_send_nonce_prefix: [u8; 4],
+    /// Monotonic counter for keepalive nonces; starts at `1u64 << 48`.
+    ka_seq: u64,
+}
+
 // ---------------------------------------------------------------------------
 // SmrpConnection
 // ---------------------------------------------------------------------------
@@ -258,6 +270,8 @@ pub struct SmrpConnection {
 
     /// Timestamp (µs) of the last `KEEPALIVE_ACK` sent; limits replies to 1/second.
     last_keepalive_ack_us: u64,
+    /// Shared with the keepalive task so it can seal authenticated KEEPALIVE packets.
+    keepalive_auth: Arc<Mutex<KeepaliveAuth>>,
 
     // --- Fragmentation ---
     /// Counter incremented each time `send()` fragments a large message.
@@ -480,7 +494,7 @@ impl SmrpConnection {
         )
     }
 
-    #[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
+    #[allow(clippy::too_many_arguments, clippy::cast_precision_loss, clippy::too_many_lines)]
     fn assemble(
         mut session: Session,
         socket: Arc<UdpSocket>,
@@ -508,27 +522,13 @@ impl SmrpConnection {
             peer_recv_window: u16::MAX,
         }));
 
-        spawn_keepalive_task(
-            Arc::clone(&socket),
-            session.peer_addr,
-            session.id,
-            keepalive_stop_rx,
-            Arc::clone(&last_recv_us),
-            dead_notify_tx.clone(),
-            dead_session_tx,
-            Arc::clone(&metrics),
-            Arc::clone(&closed),
-            cfg.keepalive_interval,
-            cfg.session_dead_timeout,
-        );
-
         spawn_retransmit_task(
             Arc::clone(&socket),
             session.peer_addr,
             session.id,
             Arc::clone(&retransmit_buf),
             retransmit_stop_rx,
-            dead_notify_tx,
+            dead_notify_tx.clone(),
             Arc::clone(&metrics),
             cfg.max_retransmits,
             cfg.rto_min,
@@ -539,11 +539,33 @@ impl SmrpConnection {
         let peer_sign_pub = session.peer_sign_pub.ok_or(SmrpError::InternalError)?;
         let recv_key = session.recv_key.take().ok_or(SmrpError::InternalError)?;
         let recv_key_bytes = *recv_key.raw_bytes();
+        let send_key = session.send_key.take().ok_or(SmrpError::InternalError)?;
+        let keepalive_auth = Arc::new(Mutex::new(KeepaliveAuth {
+            send_key_bytes: *send_key.raw_bytes(),
+            ctrl_send_nonce_prefix: session.ctrl_send_nonce_prefix,
+            ka_seq: 1u64 << 48,
+        }));
+
+        spawn_keepalive_task(
+            Arc::clone(&socket),
+            session.peer_addr,
+            session.id,
+            keepalive_stop_rx,
+            Arc::clone(&last_recv_us),
+            dead_notify_tx,
+            dead_session_tx,
+            Arc::clone(&metrics),
+            Arc::clone(&closed),
+            cfg.keepalive_interval,
+            cfg.session_dead_timeout,
+            Arc::clone(&keepalive_auth),
+        );
+
         Ok(Self {
             socket,
             peer_addr: session.peer_addr,
             session_id: session.id,
-            send_key: session.send_key.take().ok_or(SmrpError::InternalError)?,
+            send_key,
             send_seq: session.send_seq,
             recv_key,
             recv_replay: session.recv_replay,
@@ -565,6 +587,7 @@ impl SmrpConnection {
             ctrl_recv_nonce_prefix: session.ctrl_recv_nonce_prefix,
             ctrl_send_seq: 0,
             last_keepalive_ack_us: 0,
+            keepalive_auth,
             frag_send_id: 0,
             reassembly: HashMap::new(),
             sign_key,
@@ -1010,11 +1033,16 @@ impl SmrpConnection {
                         }
 
                         PacketType::Keepalive => {
+                            if self.open_ctrl_payload(&hdr, &payload).is_err() { continue; }
                             let now_us = timestamp_us();
                             if now_us.saturating_sub(self.last_keepalive_ack_us) >= 1_000_000 {
                                 let _ = self.send_keepalive_ack().await;
                                 self.last_keepalive_ack_us = now_us;
                             }
+                        }
+
+                        PacketType::KeepaliveAck => {
+                            if self.open_ctrl_payload(&hdr, &payload).is_err() { continue; }
                         }
 
                         PacketType::Ping => {
@@ -1758,6 +1786,11 @@ impl SmrpConnection {
             self.ctrl_send_nonce_prefix = ctrl_s2c_prefix;
             self.ctrl_recv_nonce_prefix = ctrl_c2s_prefix;
         }
+        // Propagate the new send key and nonce prefix to the keepalive task.
+        if let Ok(mut ka) = self.keepalive_auth.lock() {
+            ka.send_key_bytes = *self.send_key.raw_bytes();
+            ka.ctrl_send_nonce_prefix = self.ctrl_send_nonce_prefix;
+        }
         Ok(())
     }
 
@@ -1891,10 +1924,18 @@ impl SmrpConnection {
                 self.mark_closed();
             }
             PacketType::Keepalive => {
+                if self.open_ctrl_payload(&hdr, &payload).is_err() {
+                    return Ok(());
+                }
                 let now_us = timestamp_us();
                 if now_us.saturating_sub(self.last_keepalive_ack_us) >= 1_000_000 {
                     let _ = self.send_keepalive_ack().await;
                     self.last_keepalive_ack_us = now_us;
+                }
+            }
+            PacketType::KeepaliveAck => {
+                if self.open_ctrl_payload(&hdr, &payload).is_err() {
+                    return Ok(());
                 }
             }
             PacketType::Ping => {
@@ -2160,6 +2201,7 @@ fn spawn_keepalive_task(
     closed: Arc<AtomicBool>,
     probe_interval: Duration,
     dead_threshold: Duration,
+    keepalive_auth: Arc<Mutex<KeepaliveAuth>>,
 ) {
     let dead_threshold_us = dead_threshold.as_micros() as u64;
 
@@ -2186,16 +2228,34 @@ fn spawn_keepalive_task(
                         break;
                     }
 
-                    let hdr = SmrpHeader {
-                        magic: SMRP_MAGIC, version: SMRP_VERSION,
-                        packet_type: PacketType::Keepalive, flags: Flags::default(), reserved: 0,
-                        session_id, sequence_number: 0, ack_number: 0,
-                        timestamp_us: timestamp_us(), payload_len: 0,
-                        frag_id: 0, frag_index: 0, frag_count: 0, recv_window: 0,
-                        stream_id: 0,
+                    // Build an authenticated KEEPALIVE sealed with the shared ctrl key.
+                    let sealed = {
+                        let mut ka = keepalive_auth.lock().unwrap();
+                        let seq = ka.ka_seq;
+                        ka.ka_seq += 1;
+                        let key = SessionKey::from_raw(&ka.send_key_bytes);
+                        let prefix = ka.ctrl_send_nonce_prefix;
+                        drop(ka); // release lock before any await
+                        key.and_then(|k| {
+                            let nonce = make_nonce(&prefix, seq);
+                            let mut hdr = SmrpHeader {
+                                magic: SMRP_MAGIC, version: SMRP_VERSION,
+                                packet_type: PacketType::Keepalive,
+                                flags: Flags::default(), reserved: 0,
+                                session_id, sequence_number: seq, ack_number: 0,
+                                timestamp_us: timestamp_us(),
+                                payload_len: AUTH_TAG_LEN as u16,
+                                frag_id: 0, frag_index: 0, frag_count: 0,
+                                recv_window: 0, stream_id: 0,
+                            };
+                            let aad = serialize_hdr(&hdr);
+                            k.seal(&nonce, &aad, &[]).map(|tag| { hdr.timestamp_us = timestamp_us(); (hdr, tag) })
+                        })
                     };
-                    if transport::send_raw(&socket, peer_addr, &hdr, &[]).await.is_err() {
-                        break;
+                    if let Ok((hdr, tag)) = sealed {
+                        if transport::send_raw(&socket, peer_addr, &hdr, &tag).await.is_err() {
+                            break;
+                        }
                     }
                     debug!("session {session_id:?}: KEEPALIVE sent");
                 }

@@ -202,7 +202,7 @@ empty plaintext with the full 54-byte header as AAD):
 | HELLO_ACK       | 0x02    | Ed25519 sig + transcript hash        |
 | DATA            | 0x03    | ChaCha20-Poly1305 AEAD               |
 | ACK             | 0x04    | Poly1305 MAC                         |
-| KEEPALIVE       | 0x05    | no                                   |
+| KEEPALIVE       | 0x05    | Poly1305 MAC                         |
 | KEEPALIVE_ACK   | 0x06    | Poly1305 MAC                         |
 | KEY_UPDATE      | 0x07    | Ed25519 sig                          |
 | KEY_UPDATE_ACK  | 0x08    | Ed25519 sig                          |
@@ -216,9 +216,11 @@ empty plaintext with the full 54-byte header as AAD):
 | PATH_CHALLENGE  | 0x10    | no (nonce provides freshness)        |
 | PATH_RESPONSE   | 0x11    | no (echoed nonce provides freshness) |
 
-KEEPALIVE and ERROR are sent without per-packet authentication. KEEPALIVE is
-rate-limited on the receive side (at most one KEEPALIVE_ACK per second per
-connection) to prevent amplification.
+KEEPALIVE and KEEPALIVE_ACK are both Poly1305-authenticated. KEEPALIVE uses a
+dedicated nonce counter (starting at `1u64 << 48`) shared via an
+`Arc<Mutex<KeepaliveAuth>>` with the keepalive task so that session keys can be
+rotated without a race. KEEPALIVE_ACK is rate-limited on the send side (at most
+one per second per connection) to prevent amplification. ERROR is unauthenticated.
 
 PATH_CHALLENGE and PATH_RESPONSE carry no Poly1305 MAC. An attacker who can
 observe the challenge nonce could forge a PATH_RESPONSE, but cannot thereby
