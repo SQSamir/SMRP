@@ -207,7 +207,7 @@ pub async fn client_handshake(
     transport::send_raw(socket, server_addr, &hello_hdr, &hello_payload).await?;
     tracing::debug!(?session_id, "HELLO sent");
 
-    let (ack_hdr, ack_payload, _) = transport::recv_raw(socket).await?;
+    let (ack_hdr, ack_payload, _, _) = transport::recv_raw(socket).await?;
     if ack_hdr.packet_type != PacketType::HelloAck {
         return Err(SmrpError::MalformedHeader);
     }

@@ -76,7 +76,8 @@ const MIN_PMTUD_PAYLOAD: usize = 512;
 
 /// Messages routed into a per-session channel by the listener dispatch loop.
 enum SessionMsg {
-    Packet(SmrpHeader, Vec<u8>, SocketAddr),
+    /// `(header, payload, sender_addr, ce_marked)`
+    Packet(SmrpHeader, Vec<u8>, SocketAddr, bool),
     /// Injected by `SmrpListener::shutdown()` to unblock `recv_inner`.
     Shutdown,
 }
@@ -425,6 +426,7 @@ impl SmrpConnection {
         );
         if cfg.ecn_enabled {
             transport::apply_ecn_socket_option(&socket);
+            transport::enable_ecn_recv_option(&socket);
         }
         let sign_key = SigningKey::generate()?;
         let session = handshake::client_handshake(&socket, addr, &sign_key).await?;
@@ -437,12 +439,12 @@ impl SmrpConnection {
         tokio::spawn(async move {
             loop {
                 match transport::recv_raw(&socket_rx).await {
-                    Ok((hdr, payload, from_addr)) => {
+                    Ok((hdr, payload, from_addr, ce)) => {
                         if hdr.session_id != session_id {
                             continue;
                         }
                         if data_tx
-                            .send(SessionMsg::Packet(hdr, payload, from_addr))
+                            .send(SessionMsg::Packet(hdr, payload, from_addr, ce))
                             .await
                             .is_err()
                         {
@@ -896,16 +898,19 @@ impl SmrpConnection {
                     let Some(msg) = msg else {
                         return Ok(None); // channel closed
                     };
-                    let (hdr, payload, from_addr) = match msg {
+                    let (hdr, payload, from_addr, ce_marked) = match msg {
                         SessionMsg::Shutdown => {
                             // Listener is shutting down; send FIN so the peer closes promptly.
                             let _ = self.send_fin_flag().await;
                             self.mark_closed();
                             return Ok(None);
                         }
-                        SessionMsg::Packet(h, p, a) => (h, p, a),
+                        SessionMsg::Packet(h, p, a, ce) => (h, p, a, ce),
                     };
                     self.last_recv_us.store(timestamp_us(), Ordering::Relaxed);
+                    if ce_marked && self.cfg.ecn_enabled {
+                        self.react_to_ecn_ce().await;
+                    }
 
                     match hdr.packet_type {
                         PacketType::Data => {
@@ -1187,6 +1192,21 @@ impl SmrpConnection {
         let nonce = make_nonce(&self.ctrl_send_nonce_prefix, ctrl_seq);
         let tag = self.send_key.seal(&nonce, &aad, &[])?;
         transport::send_raw(&self.socket, self.peer_addr, &hdr, &tag).await
+    }
+
+    /// Reacts to an ECN Congestion-Experienced mark by halving cwnd and ssthresh,
+    /// matching the response to a loss event (RFC 3168 §6.1.2).
+    async fn react_to_ecn_ce(&mut self) {
+        let mut state = self.retransmit_buf.lock().await;
+        let new_threshold = (state.cwnd / 2).max(2);
+        state.ssthresh = new_threshold;
+        state.cwnd = new_threshold;
+        drop(state);
+        self.window_notify.notify_waiters();
+        debug!(
+            "session {:?}: ECN CE — cwnd halved to {}",
+            self.session_id, new_threshold
+        );
     }
 
     async fn send_fin_flag(&mut self) -> Result<(), SmrpError> {
@@ -1595,9 +1615,9 @@ impl SmrpConnection {
             let Some(msg) = self.data_rx.recv().await else {
                 return;
             };
-            let (hdr, payload, _) = match msg {
+            let (hdr, payload, _addr, _ce) = match msg {
                 SessionMsg::Shutdown => return,
-                SessionMsg::Packet(h, p, a) => (h, p, a),
+                SessionMsg::Packet(h, p, a, ce) => (h, p, a, ce),
             };
             if hdr.packet_type == PacketType::FinAck
                 && self.open_ctrl_payload(&hdr, &payload).is_ok()
@@ -1612,9 +1632,9 @@ impl SmrpConnection {
             let Some(msg) = self.data_rx.recv().await else {
                 return Err(SmrpError::InternalError);
             };
-            let (hdr, payload, _) = match msg {
+            let (hdr, payload, _addr, _ce) = match msg {
                 SessionMsg::Shutdown => return Err(SmrpError::InternalError),
-                SessionMsg::Packet(h, p, a) => (h, p, a),
+                SessionMsg::Packet(h, p, a, ce) => (h, p, a, ce),
             };
             if hdr.packet_type != PacketType::KeyUpdateAck {
                 continue;
@@ -2149,10 +2169,10 @@ impl SmrpReceiver {
                             inner.mark_closed();
                             return Ok(None);
                         }
-                        SessionMsg::Packet(hdr, payload, from_addr) => {
-                            // Delegate to the inner connection's packet dispatch.
-                            // Re-insert into inner.data_rx is not possible; instead,
-                            // we call the per-packet processing method directly.
+                        SessionMsg::Packet(hdr, payload, from_addr, ce) => {
+                            if ce && inner.cfg.ecn_enabled {
+                                inner.react_to_ecn_ce().await;
+                            }
                             inner.process_one_packet(hdr, payload, from_addr).await?;
                         }
                     }
@@ -2509,6 +2529,7 @@ impl SmrpListener {
         );
         if cfg.ecn_enabled {
             transport::apply_ecn_socket_option(&socket);
+            transport::enable_ecn_recv_option(&socket);
         }
         let local_addr = socket.local_addr().map_err(|_| SmrpError::InternalError)?;
         let sign_key = Arc::new(sign_key);
@@ -2694,7 +2715,7 @@ async fn listener_dispatch(
     loop {
         tokio::select! {
             result = transport::recv_raw(&socket) => {
-                let (hdr, payload, addr) = match result {
+                let (hdr, payload, addr, ce) = match result {
                     Ok(t)  => t,
                     Err(e) => { warn!("listener recv: {e}"); continue; }
                 };
@@ -2749,7 +2770,7 @@ async fn listener_dispatch(
                         let mut map = sessions.lock().await;
                         let sid    = hdr.session_id;
                         let remove = if let Some(entry) = map.get(&sid) {
-                            match entry.data_tx.try_send(SessionMsg::Packet(hdr, payload, addr)) {
+                            match entry.data_tx.try_send(SessionMsg::Packet(hdr, payload, addr, ce)) {
                                 Ok(()) => false,
                                 Err(mpsc::error::TrySendError::Full(_)) => {
                                     warn!("session {sid:?}: channel full, packet dropped");
