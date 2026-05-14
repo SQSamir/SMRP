@@ -62,12 +62,21 @@ use tokio::{
 use tracing::{debug, warn};
 
 // ---------------------------------------------------------------------------
+// PMTUD constants
+// ---------------------------------------------------------------------------
+
+/// Bytes to step payload up or down per PMTUD probe outcome.
+const PMTUD_STEP: usize = 128;
+/// Floor for effective payload — never probe below this.
+const MIN_PMTUD_PAYLOAD: usize = 512;
+
+// ---------------------------------------------------------------------------
 // Internal types
 // ---------------------------------------------------------------------------
 
 /// Messages routed into a per-session channel by the listener dispatch loop.
 enum SessionMsg {
-    Packet(SmrpHeader, Vec<u8>),
+    Packet(SmrpHeader, Vec<u8>, SocketAddr),
     /// Injected by `SmrpListener::shutdown()` to unblock `recv_inner`.
     Shutdown,
 }
@@ -288,9 +297,12 @@ pub struct SmrpConnection {
     /// Current effective DATA payload size (bytes), updated by PMTUD probes.
     /// Starts at `MAX_PAYLOAD` and is adjusted based on loss / success signals.
     effective_payload: usize,
-    /// Sequence number of the last PMTUD probe packet (0 = none in flight).
-    #[allow(dead_code)]
-    pmtud_probe_seq: u64,
+    /// Sequence number of the in-flight PMTUD probe, or `None` when idle.
+    pmtud_probe_seq: Option<u64>,
+    /// Microsecond timestamp when the current probe was sent.
+    pmtud_probe_sent_us: u64,
+    /// Microsecond timestamp when the next upward probe is allowed.
+    pmtud_next_probe_us: u64,
 
     // --- Pacing ---
     /// Available token-bucket credits (in bytes) for the send pacer.
@@ -408,12 +420,12 @@ impl SmrpConnection {
         tokio::spawn(async move {
             loop {
                 match transport::recv_raw(&socket_rx).await {
-                    Ok((hdr, payload, _)) => {
+                    Ok((hdr, payload, from_addr)) => {
                         if hdr.session_id != session_id {
                             continue;
                         }
                         if data_tx
-                            .send(SessionMsg::Packet(hdr, payload))
+                            .send(SessionMsg::Packet(hdr, payload, from_addr))
                             .await
                             .is_err()
                         {
@@ -562,7 +574,9 @@ impl SmrpConnection {
             buffered_rekey_data: Vec::new(),
             recv_key_bytes,
             effective_payload: MAX_PAYLOAD,
-            pmtud_probe_seq: 0,
+            pmtud_probe_seq: None,
+            pmtud_probe_sent_us: 0,
+            pmtud_next_probe_us: 0,
             pacing_tokens: initial_cwnd as f64 * MAX_PAYLOAD as f64,
             last_pacing_refill_us: timestamp_us(),
             pending_migration_nonce: None,
@@ -615,6 +629,83 @@ impl SmrpConnection {
                 .bytes_sent
                 .fetch_add(total_len, Ordering::Relaxed);
             Ok(())
+        }
+    }
+
+    /// Sends a single oversized DATA probe to test whether a larger payload
+    /// can traverse the path.  The probe is sealed normally; the peer will
+    /// ACK it if it arrives, triggering `effective_payload` to step up.
+    async fn send_pmtud_probe(&mut self) {
+        let probe_size = (self.effective_payload + PMTUD_STEP).min(MAX_PAYLOAD);
+        let seq = self.send_seq;
+        self.send_seq += 1;
+
+        let nonce = make_nonce(&self.data_send_nonce_prefix, seq);
+        let hdr = SmrpHeader {
+            magic: SMRP_MAGIC,
+            version: SMRP_VERSION,
+            packet_type: PacketType::Data,
+            flags: Flags::default(),
+            reserved: 0,
+            session_id: self.session_id,
+            sequence_number: seq,
+            ack_number: self.recv_seq,
+            timestamp_us: timestamp_us(),
+            payload_len: probe_size as u16,
+            frag_id: 0,
+            frag_index: 0,
+            frag_count: 1,
+            recv_window: self.advertised_recv_window(),
+            stream_id: 0,
+        };
+        let aad = data_aad(&hdr);
+        let probe_data = vec![0u8; probe_size];
+        if let Ok(ct) = self.send_key.seal(&nonce, &aad, &probe_data) {
+            let _ = transport::send_raw(&self.socket, self.peer_addr, &hdr, &ct).await;
+            self.pmtud_probe_seq = Some(seq);
+            self.pmtud_probe_sent_us = timestamp_us();
+            self.metrics
+                .bytes_sent
+                .fetch_add(probe_size as u64, Ordering::Relaxed);
+            debug!("PMTUD: probe sent (seq={seq}, size={probe_size})");
+        }
+    }
+
+    /// Checks PMTUD probe state after each receive iteration:
+    /// - times out an in-flight probe and steps `effective_payload` down, or
+    /// - sends a new upward probe if the interval has elapsed.
+    async fn maybe_run_pmtud(&mut self) {
+        if !self.cfg.pmtud_enabled {
+            return;
+        }
+        let now_us = timestamp_us();
+
+        if self.pmtud_probe_seq.is_some() {
+            let rtt_us = self
+                .retransmit_buf
+                .try_lock()
+                .map_or(200_000u64, |b| b.rtt.current.max(50_000));
+            if now_us.saturating_sub(self.pmtud_probe_sent_us) > rtt_us * 4 {
+                let new_size = self
+                    .effective_payload
+                    .saturating_sub(PMTUD_STEP)
+                    .max(MIN_PMTUD_PAYLOAD);
+                if new_size < self.effective_payload {
+                    debug!(
+                        "PMTUD: probe timeout, stepping down {} -> {new_size}",
+                        self.effective_payload
+                    );
+                    self.effective_payload = new_size;
+                }
+                self.pmtud_probe_seq = None;
+                self.pmtud_next_probe_us =
+                    now_us + self.cfg.pmtud_probe_interval.as_micros() as u64;
+            }
+            return;
+        }
+
+        if now_us >= self.pmtud_next_probe_us && self.effective_payload < MAX_PAYLOAD {
+            self.send_pmtud_probe().await;
         }
     }
 
@@ -775,14 +866,14 @@ impl SmrpConnection {
                     let Some(msg) = msg else {
                         return Ok(None); // channel closed
                     };
-                    let (hdr, payload) = match msg {
+                    let (hdr, payload, from_addr) = match msg {
                         SessionMsg::Shutdown => {
                             // Listener is shutting down; send FIN so the peer closes promptly.
                             let _ = self.send_fin_flag().await;
                             self.mark_closed();
                             return Ok(None);
                         }
-                        SessionMsg::Packet(h, p) => (h, p),
+                        SessionMsg::Packet(h, p, a) => (h, p, a),
                     };
                     self.last_recv_us.store(timestamp_us(), Ordering::Relaxed);
 
@@ -953,16 +1044,19 @@ impl SmrpConnection {
                             // the peer is reachable at the new address — migrate.
                             if let Some(nonce) = self.pending_migration_nonce {
                                 if payload.len() >= 8 && payload[..8] == nonce {
-                                    // Peer confirmed; update peer_addr.
-                                    // (addr comes from the SessionMsg; for now we record
-                                    //  it when we sent the challenge via migration_challenge_addr)
                                     self.pending_migration_nonce = None;
+                                    self.peer_addr = from_addr;
+                                    tracing::info!(
+                                        "session {:?}: migrated to new peer address {}",
+                                        self.session_id, from_addr
+                                    );
                                 }
                             }
                         }
 
                         _ => {}
                     }
+                    self.maybe_run_pmtud().await;
                 }
 
                 _ = self.dead_rx.recv() => {
@@ -1355,6 +1449,21 @@ impl SmrpConnection {
         // Clear sacked entries that the cumulative ACK has now covered.
         buf.sacked.retain(|&s| s > ack_n);
 
+        // PMTUD: if the in-flight probe was covered by this ACK, step up.
+        if let Some(probe_seq) = self.pmtud_probe_seq {
+            if ack_n >= probe_seq {
+                let new_size = (self.effective_payload + PMTUD_STEP).min(MAX_PAYLOAD);
+                debug!(
+                    "PMTUD: probe ACKed, stepping up {} -> {new_size}",
+                    self.effective_payload
+                );
+                self.effective_payload = new_size;
+                self.pmtud_probe_seq = None;
+                self.pmtud_next_probe_us =
+                    timestamp_us() + self.cfg.pmtud_probe_interval.as_micros() as u64;
+            }
+        }
+
         if any_removed {
             // AIMD: one window-open event per ACK batch.
             if buf.cwnd < buf.ssthresh {
@@ -1451,9 +1560,9 @@ impl SmrpConnection {
             let Some(msg) = self.data_rx.recv().await else {
                 return;
             };
-            let (hdr, payload) = match msg {
+            let (hdr, payload, _) = match msg {
                 SessionMsg::Shutdown => return,
-                SessionMsg::Packet(h, p) => (h, p),
+                SessionMsg::Packet(h, p, a) => (h, p, a),
             };
             if hdr.packet_type == PacketType::FinAck
                 && self.open_ctrl_payload(&hdr, &payload).is_ok()
@@ -1468,9 +1577,9 @@ impl SmrpConnection {
             let Some(msg) = self.data_rx.recv().await else {
                 return Err(SmrpError::InternalError);
             };
-            let (hdr, payload) = match msg {
+            let (hdr, payload, _) = match msg {
                 SessionMsg::Shutdown => return Err(SmrpError::InternalError),
-                SessionMsg::Packet(h, p) => (h, p),
+                SessionMsg::Packet(h, p, a) => (h, p, a),
             };
             if hdr.packet_type != PacketType::KeyUpdateAck {
                 continue;
@@ -1657,6 +1766,7 @@ impl SmrpConnection {
         &mut self,
         hdr: SmrpHeader,
         payload: Vec<u8>,
+        _from_addr: SocketAddr,
     ) -> Result<(), SmrpError> {
         let seq = hdr.sequence_number;
         if self.recv_replay.can_accept(seq).is_err() {
@@ -1732,10 +1842,11 @@ impl SmrpConnection {
         &mut self,
         hdr: SmrpHeader,
         payload: Vec<u8>,
+        from_addr: SocketAddr,
     ) -> Result<(), SmrpError> {
         match hdr.packet_type {
             PacketType::Data => {
-                return self.handle_data_packet(hdr, payload).await;
+                return self.handle_data_packet(hdr, payload, from_addr).await;
             }
             PacketType::Ack => {
                 if self.open_ctrl_payload(&hdr, &payload).is_err() {
@@ -1808,6 +1919,12 @@ impl SmrpConnection {
                 if let Some(nonce) = self.pending_migration_nonce {
                     if payload.len() >= 8 && payload[..8] == nonce {
                         self.pending_migration_nonce = None;
+                        self.peer_addr = from_addr;
+                        tracing::info!(
+                            "session {:?}: migrated to new peer address {}",
+                            self.session_id,
+                            from_addr
+                        );
                     }
                 }
             }
@@ -1984,11 +2101,11 @@ impl SmrpReceiver {
                             inner.mark_closed();
                             return Ok(None);
                         }
-                        SessionMsg::Packet(hdr, payload) => {
+                        SessionMsg::Packet(hdr, payload, from_addr) => {
                             // Delegate to the inner connection's packet dispatch.
                             // Re-insert into inner.data_rx is not possible; instead,
                             // we call the per-packet processing method directly.
-                            inner.process_one_packet(hdr, payload).await?;
+                            inner.process_one_packet(hdr, payload, from_addr).await?;
                         }
                     }
                 }
@@ -2562,7 +2679,7 @@ async fn listener_dispatch(
                         let mut map = sessions.lock().await;
                         let sid    = hdr.session_id;
                         let remove = if let Some(entry) = map.get(&sid) {
-                            match entry.data_tx.try_send(SessionMsg::Packet(hdr, payload)) {
+                            match entry.data_tx.try_send(SessionMsg::Packet(hdr, payload, addr)) {
                                 Ok(()) => false,
                                 Err(mpsc::error::TrySendError::Full(_)) => {
                                     warn!("session {sid:?}: channel full, packet dropped");
