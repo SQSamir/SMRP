@@ -1,6 +1,6 @@
 # SMRP Threat Model
 
-Wire version: `0x02`
+Wire version: `0x05`
 
 This document describes the security assumptions, goals, non-goals, cryptographic
 design rationale, and known attack surface for the Secure Minimal Reliable Protocol
@@ -62,8 +62,9 @@ The following are explicitly outside the scope of SMRP's security model:
 - **PKI / Certificate Infrastructure:** There is no certificate authority, no
   certificate chain validation, and no X.509 support. Key authenticity is the
   application's responsibility.
-- **Fragmentation:** SMRP does not fragment payloads. Oversized messages must be
-  handled at the application layer.
+- **Fragmentation transparency:** SMRP automatically fragments payloads larger than
+  `MAX_PAYLOAD` at the library level. The application layer does not need to split
+  messages manually, but the fragment overhead is visible to a passive observer.
 - **Traffic Analysis Resistance:** Session IDs, packet types, and sequence numbers are
   visible in cleartext. An observer can determine session boundaries, packet counts,
   and timing.
@@ -112,17 +113,23 @@ All session payload encryption uses ChaCha20-Poly1305. It was chosen because:
 
 ## Known Attack Surface
 
-### KEEPALIVE Packets Are Unauthenticated
-`KEEPALIVE` packets are transmitted outside the session key scope without a MAC or
-signature. Consequently:
-- An attacker can **inject fake KEEPALIVE packets** to prevent a session from timing
-  out, keeping a dead session alive indefinitely (session-liveness DoS).
-- An attacker can **suppress KEEPALIVE packets** to cause a live session to appear dead
-  and be torn down prematurely.
+### KEEPALIVE Authentication and Residual Risk
+`KEEPALIVE` and `KEEPALIVE_ACK` packets carry a 16-byte Poly1305 MAC derived from the
+session's HKDF-derived control key and a dedicated nonce counter (starting at
+`1u64 << 48`). Spoofed KEEPALIVE or KEEPALIVE_ACK packets are rejected by MAC
+verification — an off-path attacker without the session key cannot inject valid probes.
 
-Neither variant exposes plaintext or session keys, but both can disrupt availability.
-Mitigations: application-level heartbeats authenticated within the session, or moving
-KEEPALIVE into the encrypted data plane in a future wire version.
+**Residual risk — traffic flooding:** A volumetric attacker who can flood the peer's
+UDP port with arbitrary packets can still affect the dead-session timer indirectly by
+saturating the receive path, but cannot forge authenticated KEEPALIVE frames.
+
+**Residual risk — suppression:** An on-path attacker who drops all KEEPALIVE packets
+can cause the session to time out if the peer stops receiving traffic. This is
+equivalent to a general packet-drop attack and is not uniquely addressable at the
+protocol layer.
+
+`KEEPALIVE_ACK` is additionally rate-limited to **one per second per connection** to
+prevent amplification from any probe (authenticated or not).
 
 ### HELLO Replay Attacks
 HELLO packets initiate new sessions. They include a timestamp, and the receiver rejects
