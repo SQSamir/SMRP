@@ -494,7 +494,11 @@ impl SmrpConnection {
         )
     }
 
-    #[allow(clippy::too_many_arguments, clippy::cast_precision_loss, clippy::too_many_lines)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::cast_precision_loss,
+        clippy::too_many_lines
+    )]
     fn assemble(
         mut session: Session,
         socket: Arc<UdpSocket>,
@@ -2238,7 +2242,7 @@ fn spawn_keepalive_task(
                         drop(ka); // release lock before any await
                         key.and_then(|k| {
                             let nonce = make_nonce(&prefix, seq);
-                            let mut hdr = SmrpHeader {
+                            let hdr = SmrpHeader {
                                 magic: SMRP_MAGIC, version: SMRP_VERSION,
                                 packet_type: PacketType::Keepalive,
                                 flags: Flags::default(), reserved: 0,
@@ -2249,7 +2253,7 @@ fn spawn_keepalive_task(
                                 recv_window: 0, stream_id: 0,
                             };
                             let aad = serialize_hdr(&hdr);
-                            k.seal(&nonce, &aad, &[]).map(|tag| { hdr.timestamp_us = timestamp_us(); (hdr, tag) })
+                            k.seal(&nonce, &aad, &[]).map(|tag| (hdr, tag))
                         })
                     };
                     if let Ok((hdr, tag)) = sealed {
