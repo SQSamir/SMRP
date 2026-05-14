@@ -409,6 +409,9 @@ impl SmrpConnection {
                 .await
                 .map_err(|_| SmrpError::InternalError)?,
         );
+        if cfg.ecn_enabled {
+            transport::apply_ecn_socket_option(&socket);
+        }
         let sign_key = SigningKey::generate()?;
         let session = handshake::client_handshake(&socket, addr, &sign_key).await?;
         let sign_key = Arc::new(sign_key);
@@ -2440,6 +2443,9 @@ impl SmrpListener {
                 .await
                 .map_err(|_| SmrpError::InternalError)?,
         );
+        if cfg.ecn_enabled {
+            transport::apply_ecn_socket_option(&socket);
+        }
         let local_addr = socket.local_addr().map_err(|_| SmrpError::InternalError)?;
         let sign_key = Arc::new(sign_key);
         let sessions: SessionMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));

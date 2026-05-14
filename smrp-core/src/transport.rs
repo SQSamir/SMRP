@@ -6,6 +6,34 @@ use crate::{
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 
+/// Marks outgoing packets as ECN-capable (ECT(0), `0x02`) via `IP_TOS` (IPv4)
+/// or `IPV6_TCLASS` (IPv6).  Failures are silently ignored — the config field
+/// documents that ECN is best-effort when the OS does not support the option.
+#[cfg(unix)]
+pub fn apply_ecn_socket_option(socket: &UdpSocket) {
+    use std::os::unix::io::AsRawFd;
+    let fd = socket.as_raw_fd();
+    let ect0: libc::c_int = 0x02; // ECT(0)
+    let len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let (level, optname) = match socket.local_addr() {
+        Ok(addr) if addr.is_ipv4() => (libc::IPPROTO_IP, libc::IP_TOS),
+        _ => (libc::IPPROTO_IPV6, libc::IPV6_TCLASS),
+    };
+    // SAFETY: fd is valid for the lifetime of socket; ect0 lives on the stack.
+    unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            optname,
+            std::ptr::addr_of!(ect0).cast::<libc::c_void>(),
+            len,
+        );
+    }
+}
+
+#[cfg(not(unix))]
+pub fn apply_ecn_socket_option(_socket: &UdpSocket) {}
+
 /// Serialises `header` + `payload` into a single UDP datagram and sends it to `addr`.
 ///
 /// # Errors
