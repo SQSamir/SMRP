@@ -85,13 +85,13 @@ fn recv_one_ecn(
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_name = std::ptr::addr_of_mut!(src).cast();
     msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as _;
-    msg.msg_iov = &mut iov;
+    msg.msg_iov = std::ptr::addr_of_mut!(iov);
     msg.msg_iovlen = 1;
     msg.msg_control = ctrl.as_mut_ptr().cast();
     msg.msg_controllen = ctrl.len() as _;
 
     // SAFETY: all fields of msg are initialised above; fd is valid.
-    let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT) };
+    let n = unsafe { libc::recvmsg(fd, std::ptr::addr_of_mut!(msg), libc::MSG_DONTWAIT) };
     if n < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -122,7 +122,7 @@ fn recv_one_ecn(
     let mut ce = false;
     // SAFETY: msg was populated by recvmsg; CMSG_* macros are safe to call
     // on a valid msghdr with a properly sized control buffer.
-    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(std::ptr::addr_of!(msg)) };
     while !cmsg.is_null() {
         // SAFETY: cmsg pointer is within the ctrl buffer and was set by the OS.
         let (level, typ) = unsafe { ((*cmsg).cmsg_level, (*cmsg).cmsg_type) };
@@ -139,10 +139,10 @@ fn recv_one_ecn(
             ce = (tclass & 0x03) == 0x03;
         }
         // SAFETY: cmsg and msg are valid pointers set by recvmsg.
-        cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
+        cmsg = unsafe { libc::CMSG_NXTHDR(std::ptr::addr_of!(msg), cmsg) };
     }
 
-    data.truncate(n as usize);
+    data.truncate(n.cast_unsigned());
     Ok((data, addr, ce))
 }
 
@@ -204,9 +204,9 @@ pub async fn recv_raw(
                     return Ok((header, payload, addr, ce));
                 }
                 // Spurious wakeup — re-arm and wait for the next edge.
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 // Windows-style ICMP feedback on a closed peer port — transient.
-                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
                 Err(_) => return Err(SmrpError::InternalError),
             }
         }

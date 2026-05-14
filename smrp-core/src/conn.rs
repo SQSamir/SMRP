@@ -1050,9 +1050,7 @@ impl SmrpConnection {
                             }
                         }
 
-                        PacketType::KeepaliveAck => {
-                            if self.open_ctrl_payload(&hdr, &payload).is_err() { continue; }
-                        }
+                        PacketType::KeepaliveAck if self.open_ctrl_payload(&hdr, &payload).is_ok() => {}
 
                         PacketType::Ping => {
                             if self.open_ctrl_payload(&hdr, &payload).is_err() { continue; }
@@ -1957,11 +1955,7 @@ impl SmrpConnection {
                     self.last_keepalive_ack_us = now_us;
                 }
             }
-            PacketType::KeepaliveAck => {
-                if self.open_ctrl_payload(&hdr, &payload).is_err() {
-                    return Ok(());
-                }
-            }
+            PacketType::KeepaliveAck if self.open_ctrl_payload(&hdr, &payload).is_ok() => {}
             PacketType::Ping => {
                 if self.open_ctrl_payload(&hdr, &payload).is_err() {
                     return Ok(());
